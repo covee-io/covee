@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#172a29">
+  <title>Covee · Your network</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div id="boot" class="boot" role="status">Opening your network…</div>
+  <section id="signin" class="signin" hidden aria-labelledby="signin-title">
+    <div class="signin-story">
+      <a class="brand" href="/" aria-label="Covee home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>Covee</a>
+      <div class="signin-intro"><div class="eyebrow">YOUR NETWORK. YOUR RULES.</div><h1>A little closer.<br>Wherever you are.</h1><p>A private network for the people and devices you choose. Managed from a place you own.</p></div>
+      <div class="network-art" aria-hidden="true"><div class="network-orbit orbit-one"></div><div class="network-orbit orbit-two"></div><span class="network-center">A</span><span class="network-node node-one"></span><span class="network-node node-two"></span><span class="network-node node-three"></span><span class="network-node node-four"></span></div>
+      <span class="signin-foot">Self-hosted network management</span>
+    </div>
+    <div class="signin-panel"><div class="signin-form-wrap"><span class="eyebrow">ADMINISTRATION</span><h2 id="signin-title">Welcome to your network.</h2><p id="signin-description" class="muted">Sign in to continue.</p><p id="login-error" class="form-error" role="alert" hidden></p><form id="login-form" hidden><label for="login-token">Administrator token</label><input id="login-token" name="token" type="password" required autocomplete="current-password" spellcheck="false"><button class="button primary full-width" type="submit">Open console <span aria-hidden="true">→</span></button></form><form id="oidc-login-form" method="post" action="/auth/oidc/login" hidden><button class="button primary full-width" type="submit">Sign in with Entra ID</button></form><p id="signin-note" class="signin-note"></p></div></div>
+  </section>
+  <div id="app" class="app" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="#overview"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>Covee</a>
+      <div class="network-switch"><span class="network-avatar" aria-hidden="true">N</span><span><strong>Your network</strong><small>Self-hosted workspace</small></span><span class="network-switch-dot" aria-hidden="true"></span></div>
+      <div class="nav-caption">WORKSPACE</div><nav id="navigation" aria-label="Main navigation"></nav>
+      <div class="sidebar-footer"><div class="sidebar-note"><span class="side-icon" id="sidebar-icon" aria-hidden="true"></span><span>Built around your<br>own infrastructure.</span></div><button id="logout" class="logout-button" type="button">Sign out <span aria-hidden="true">↗</span></button></div>
+    </aside>
+    <div class="workspace"><header class="topbar"><span class="breadcrumb">Workspace <span aria-hidden="true">/</span> <strong id="breadcrumb-title">Overview</strong></span><div class="topbar-right"><span id="session-identity" class="sync-status"></span><span id="sync-status" class="sync-status">Ready</span><span class="admin-avatar" title="Signed-in user" aria-label="Signed-in user">A</span></div></header><main id="main" tabindex="-1"><div id="page" class="page"></div></main><footer class="workspace-footer"><span>Covee</span><span>Your infrastructure. Your connections.</span></footer></div>
+  </div>
+  <div id="notification" class="notification" role="status" aria-live="polite" hidden></div>
+  <dialog id="dialog" aria-labelledby="dialog-title"><div id="dialog-content"></div></dialog>
+</body>
+</html>

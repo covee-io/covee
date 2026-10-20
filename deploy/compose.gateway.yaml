@@ -1,0 +1,73 @@
+# Optional overlay for runtimes with a gateway (deployment field gateway). The
+# gateway device joins the network as the tagged device "gateway" and carries
+# members' traffic for the routes the admin console chooses: to private
+# networks the server can reach, or out with the server's own address. It
+# reaches the coordinator through the gateway's alias for the control host on
+# the internal backend network, and its forwarded traffic leaves through its
+# own egress network, like any container's outbound traffic.
+#
+# The management service keeps the console's gateway settings in
+# state/management/gateway: routes.json, which the gateway reads, and dns.json,
+# which the host applies to the coordinator's DNS settings.
+services:
+  management:
+    environment:
+      COVEE_GATEWAY_TAG: tag:covee-gateway
+      COVEE_GATEWAY_DIR: /data/gateway
+
+  gateway:
+    image: ${COVEE_GATEWAY_IMAGE:-covee-gateway:portable-local}
+    environment:
+      COVEE_CONTROL_URL: https://${COVEE_CONTROL_HOST:?}
+      COVEE_GATEWAY_HOSTNAME: gateway
+      COVEE_GATEWAY_STATE: /var/lib/covee-gateway
+      COVEE_GATEWAY_AUTHKEY_FILE: /var/lib/covee-gateway/join-key
+      COVEE_GATEWAY_ROUTES: /etc/covee-gateway/routes.json
+      # Never upload logs to Tailscale's log service.
+      TS_NO_LOGS_NO_SUPPORT: "true"
+      HOME: /tmp
+    user: "${COVEE_UID:?}:${COVEE_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    pids_limit: 256
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    stop_grace_period: 10s
+    networks: [backend, gateway-egress]
+    depends_on:
+      ingress: {condition: service_started}
+    healthcheck:
+      test: [CMD, /covee-gateway, -health]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${COVEE_UID:?},gid=${COVEE_GID:?}"
+    volumes:
+      # The device identity, and its one-time join key until it has joined.
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/gateway
+        target: /var/lib/covee-gateway
+        bind: {create_host_path: false}
+      # The routes the console chose, written by the management service.
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/management/gateway
+        target: /etc/covee-gateway
+        read_only: true
+        bind: {create_host_path: false}
+
+networks:
+  # The server's firewall admits SSH from this bridge (scripts/proxmox.py
+  # GATEWAY_BRIDGE), so admins can reach the server through the gateway.
+  gateway-egress:
+    driver_opts:
+      com.docker.network.bridge.name: covee-gw0

@@ -1,0 +1,14 @@
+.cache
+.git
+.agents
+.codex
+.aws
+data
+evidence
+lab
+docs
+parity
+scripts
+tests
+native
+*.env

@@ -1,0 +1,295 @@
+<title>Covee</title>
+<link rel="stylesheet" href="style.css">
+<!--#header-->
+<main>
+  <section class="hero">
+    <canvas id="contours" aria-hidden="true"></canvas>
+    <div class="wrap">
+      <div>
+        <p class="eyebrow">Open source · self-hosted · WireGuard</p>
+        <h1>Your own <em>private network</em>, on a server you own.</h1>
+        <p class="lede">Covee connects your people and devices over direct, encrypted connections, wherever they are. One command builds the network on your server, sign-in and certificate included. No per-user limits, and no Covee service in the middle.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/covee-io/covee/releases/latest/download/Covee.dmg">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+            Download for Mac
+          </a>
+          <a class="button secondary" href="docs/index.html">Read the guide</a>
+        </div>
+        <p class="fine">Covee for Mac needs Apple silicon and macOS 15 or later. The <code>covee</code> command runs on macOS and Linux.</p>
+      </div>
+      <div class="terminal" role="img" aria-label="A covee setup session that ends with the network running">
+        <div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="p">$</span> covee setup
+Covee setup builds a complete network on a server you choose. Nothing is changed until you confirm the summary at the end.
+<span class="d">…</span>
+Summary for network office (Example Co):
+  • Server ubuntu@203.0.113.20 will be dedicated to Covee (SSH from 198.51.100.0/24 only)
+  • Sign-in: Microsoft (Entra ID / Office 365)
+  • A free Let's Encrypt certificate for covee.example.com and console.mesh.example.com
+<span class="s">? Set up now (Y/n):</span> yes
+[3/13] Set up Microsoft sign-in
+[5/13] Get the certificate for covee.example.com
+  Certificate issued by R11, valid until 16 January 2027.
+[10/13] Build the Covee services (about 10 minutes)
+[13/13] Check the network
+
+<span class="ok">Network office is running at https://covee.example.com.</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="how">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Three parts, all of them yours.</h2>
+        <p>The <code>covee</code> command builds and runs the network from your computer. The server coordinates and relays. Your devices talk to each other directly, end to end encrypted; the server cannot read that traffic.</p>
+      </div>
+      <div class="flow">
+        <div>
+          <h3>Your computer <span>covee</span></h3>
+          <p>Sets the server up over SSH, registers sign-in, gets the certificate, and later updates, backs up and renames the network, using your own SSH, AWS and Azure logins.</p>
+          <ul><li>macOS or Linux</li><li>keys in ~/.config/covee or Parameter Store</li></ul>
+        </div>
+        <div>
+          <h3>Your server <span>Ubuntu 24.04</span></h3>
+          <p>Runs the coordinator, a relay, sign-in and the admin console in hardened containers. Open to the internet on two ports only.</p>
+          <ul><li>TCP 443 · coordinator, sign-in, relay</li><li>UDP 3478 · STUN</li><li>SSH only from networks you allow</li></ul>
+        </div>
+        <div>
+          <h3>Your devices <span>WireGuard</span></h3>
+          <p>Get private addresses and names, and connect directly when they can, through the relay when they cannot.</p>
+          <ul><li>laptop.mesh.example.com · 100.64.0.7</li><li>Covee for Mac · Tailscale clients</li></ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Everything a network needs, set up for you.</h2>
+        <p><code>covee setup</code> does the hard parts of running your own coordinator, and checks everything before it changes anything.</p>
+      </div>
+      <div class="features">
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+          <div><h3>Sign-in people already have</h3><p>Microsoft Entra ID, Google and Apple, or Covee's own accounts with a passkey or a password and authenticator. Each network registers its own Microsoft app and group.</p></div>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6Z"/><path d="m9 12 2 2 4-4"/></svg>
+          <div><h3>A hardened server</h3><p>A firewall that admits only what the network needs, SSH limited to one key-only account, and services running unprivileged with read-only file systems.</p></div>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+          <div><h3>DNS and certificates</h3><p>Records kept in Route 53 or Cloudflare, a home address followed as it changes (with Route 53), and a Let's Encrypt certificate proved through DNS, so no port needs to be open first.</p></div>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18"/><path d="M8 21h8"/></svg>
+          <div><h3>A private admin console</h3><p>People, devices, keys, access rules and the gateway, with every change recorded. Reached through an SSH tunnel, or from inside the network, never from the internet.</p></div>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16v13H4z"/><path d="M8 7V4h8v3"/><path d="M12 11v5"/><path d="m9.5 13.5 2.5 2.5 2.5-2.5"/></svg>
+          <div><h3>Backups you can restore</h3><p>Encrypted snapshots, checked on your computer, that rebuild the network on a new server with every device, account and setting.</p></div>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3Z"/></svg>
+          <div><h3>Exit nodes and shared networks</h3><p>A device can send others' internet traffic out through itself, or share the network behind it, once an administrator approves it.</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="gateway">
+    <div class="wrap split">
+      <div>
+        <div class="section-head">
+          <h2>Reach what only your server can.</h2>
+          <p>Turn on the gateway, and devices can reach a cloud's private networks through your server, or leave through its address for services that allow only that one. You choose each destination and who may use it. Everything else goes directly.</p>
+        </div>
+        <ul class="checks">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4 10-10"/></svg><span><strong>Address ranges or host names.</strong> Names are looked up from the server, so a private endpoint gets its private address.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4 10-10"/></svg><span><strong>Private DNS.</strong> Names like <code>vault.azure.net</code> resolve through your cloud's resolver.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4 10-10"/></svg><span><strong>Access kept in step.</strong> The console writes the matching access rules, and never touches rules it did not add.</span></li>
+        </ul>
+      </div>
+      <div class="console" role="img" aria-label="The admin console's Gateway page with three active destinations">
+        <header>
+          <div><strong>Through the gateway</strong><span>Traffic to these destinations goes through the gateway device; everything else goes directly.</span></div>
+          <span class="console-button">+ Add destination</span>
+        </header>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Name</th><th>Destinations</th><th>Who</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td>Cloud private networks</td><td><code>10.40.0.0/16</code><code>10.41.0.0/16</code></td><td>Everyone in the network</td><td><span class="pill">Active</span></td></tr>
+              <tr><td>Production database</td><td><code>db-0.example.net → 198.51.100.7</code><code>db-1.example.net → 198.51.100.8</code></td><td>alice@example.com, bob@example.com</td><td><span class="pill">Active</span></td></tr>
+              <tr><td>Key vault</td><td><code>vault.example.net → 10.40.7.4</code></td><td>Everyone in the network</td><td><span class="pill">Active</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="console-foot">Host names are looked up from the server every 5 minutes. Devices use these routes when the app’s gateway setting is on.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="start">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Running in about fifteen minutes.</h2>
+        <p>You need a fresh Ubuntu 24.04 server reachable on TCP 443 and UDP 3478, a domain name, and a way for people to sign in.</p>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <h3>Install the command</h3>
+          <p>With Homebrew on macOS or Linux, or from the releases page.</p>
+          <div class="snippet"><code id="cmd-install">brew install covee-io/tap/covee</code><button class="copy" type="button" data-copy="cmd-install">Copy</button></div>
+        </div>
+        <div class="step">
+          <h3>Build your network</h3>
+          <p>It changes nothing until you confirm a summary of what it will do.</p>
+          <div class="snippet"><code id="cmd-setup">covee setup</code><button class="copy" type="button" data-copy="cmd-setup">Copy</button></div>
+        </div>
+        <div class="step">
+          <h3>Connect your devices</h3>
+          <p>Open Covee for Mac, or point a Tailscale client at your server, and sign in.</p>
+          <div class="snippet"><code id="cmd-linux">sudo tailscale up --login-server=https://covee.example.com</code><button class="copy" type="button" data-copy="cmd-linux">Copy</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="download">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Devices</h2>
+        <p>Covee's own apps, and Tailscale's open clients pointed at your server.</p>
+      </div>
+      <div class="platforms">
+        <div class="platform">
+          <span class="tag">Apple silicon · macOS 15+</span>
+          <h3>Covee for Mac</h3>
+          <p>A menu bar app with sign-in, exit nodes and the gateway switch. Signed with a Developer ID and notarized by Apple.</p>
+          <p><a href="https://github.com/covee-io/covee/releases/latest/download/Covee.dmg">Download Covee.dmg</a>, or <code>brew install --cask covee-io/tap/covee</code></p>
+        </div>
+        <div class="platform">
+          <span class="tag">iOS</span>
+          <h3>iPhone</h3>
+          <p>Covee for iPhone is in testing. Meanwhile, Tailscale's iPhone app joins your network once your server is set as its coordination server.</p>
+          <p><a href="docs/devices.html#iphone">How to set it up</a></p>
+        </div>
+        <div class="platform">
+          <span class="tag">Linux · Windows · Android</span>
+          <h3>Everything else</h3>
+          <p>The standard Tailscale clients, with your server as the login server. Servers can join with a one-time device key.</p>
+          <p><a href="docs/devices.html">Connect your devices</a></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <div class="wrap oss">
+      <div class="section-head">
+        <h2>Open source, end to end.</h2>
+        <p>Covee is free under the Apache 2.0 license. It builds on Headscale, an open-source implementation of the Tailscale control server, and on Tailscale's open-source client engine. Nothing reports home: the command and the apps talk only to your server and the providers you choose.</p>
+        <div class="actions"><a class="button secondary" href="https://github.com/covee-io/covee">View the source on GitHub</a></div>
+      </div>
+      <dl class="facts">
+        <dt>License</dt><dd>Apache 2.0</dd>
+        <dt>Coordinator</dt><dd>Headscale</dd>
+        <dt>Encryption</dt><dd>WireGuard, keys kept on each device</dd>
+        <dt>Server</dt><dd>Ubuntu 24.04, amd64</dd>
+        <dt>Telemetry</dt><dd>None</dd>
+      </dl>
+    </div>
+  </section>
+</main>
+<!--#footer-->
+<script src="site.js"></script>
+<script>
+// Depth contours of a sheltered bay behind the hero: a smooth field of a few
+// basins, traced at nine depths with marching squares. It drifts slowly,
+// pauses when out of sight, and stays still for reduced motion.
+(() => {
+  const canvas = document.getElementById('contours');
+  const ctx = canvas && canvas.getContext && canvas.getContext('2d');
+  if (!ctx) return;
+  const still = matchMedia('(prefers-reduced-motion: reduce)');
+  const basins = [[0.92, 0.18, 0.55], [0.72, 0.62, 0.42], [1.05, 0.95, 0.5], [0.55, 0.05, 0.3]];
+  let width = 0, height = 0, time = 0, visible = true, last = 0, pending = 0;
+
+  function depth(x, y) {
+    let value = 0;
+    for (const [bx, by, r] of basins) {
+      const dx = x - bx - 0.02 * Math.sin(time + by * 6);
+      const dy = y - by - 0.02 * Math.cos(time + bx * 5);
+      value += Math.exp(-(dx * dx + dy * dy) / (r * r));
+    }
+    return value;
+  }
+  function resize() {
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    width = canvas.clientWidth;
+    height = canvas.clientHeight;
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+  function draw() {
+    ctx.clearRect(0, 0, width, height);
+    if (!width || !height) return;
+    const step = 14, cols = Math.ceil(width / step) + 1, rows = Math.ceil(height / step) + 1;
+    const grid = new Float32Array(cols * rows);
+    for (let j = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++) grid[j * cols + i] = depth((i * step) / height / 1.6, (j * step) / height);
+    }
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--sea').trim() || '#22c3d6';
+    ctx.lineWidth = 1;
+    for (let k = 1; k <= 9; k++) {
+      const level = k * 0.11;
+      ctx.globalAlpha = 0.07 + k * 0.013;
+      ctx.beginPath();
+      for (let j = 0; j < rows - 1; j++) {
+        for (let i = 0; i < cols - 1; i++) {
+          const a = grid[j * cols + i], b = grid[j * cols + i + 1], c = grid[(j + 1) * cols + i + 1], d = grid[(j + 1) * cols + i];
+          const x = i * step, y = j * step, points = [];
+          const cross = (v1, v2, x1, y1, x2, y2) => {
+            if ((v1 < level) === (v2 < level)) return;
+            const f = (level - v1) / (v2 - v1);
+            points.push(x1 + f * (x2 - x1), y1 + f * (y2 - y1));
+          };
+          cross(a, b, x, y, x + step, y);
+          cross(b, c, x + step, y, x + step, y + step);
+          cross(c, d, x + step, y + step, x, y + step);
+          cross(d, a, x, y + step, x, y);
+          for (let p = 0; p + 3 < points.length; p += 4) {
+            ctx.moveTo(points[p], points[p + 1]);
+            ctx.lineTo(points[p + 2], points[p + 3]);
+          }
+        }
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  function tick(now) {
+    pending = 0;
+    if (!visible || still.matches) return;
+    if (now - last > 80) { time += 0.02; last = now; draw(); }
+    pending = requestAnimationFrame(tick);
+  }
+  function start() { if (!pending && visible && !still.matches) pending = requestAnimationFrame(tick); }
+
+  resize();
+  draw();
+  addEventListener('resize', () => { resize(); draw(); });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  still.addEventListener('change', start);
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver(entries => { visible = entries[0].isIntersecting; start(); }).observe(canvas);
+  }
+  start();
+})();
+</script>

@@ -1,0 +1,6 @@
+# Start only with --no-deps. Remove this overlay after policy verification by
+# force-recreating ingress using the ordinary selected runtime configuration.
+services:
+  ingress:
+    environment:
+      COVEE_IDENTITY_ONLY: "true"

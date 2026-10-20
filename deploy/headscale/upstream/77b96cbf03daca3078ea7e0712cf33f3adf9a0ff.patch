@@ -1,0 +1,2036 @@
+From 77b96cbf03daca3078ea7e0712cf33f3adf9a0ff Mon Sep 17 00:00:00 2001
+From: Kristoffer Dalby <kristoffer@dalby.cc>
+Date: Fri, 9 Oct 2026 13:12:25 +0000
+Subject: [PATCH] policy/v2: revoke stale SSH access and recheck authentication
+
+Updates #3517, #3508
+
+(cherry picked from commit 4fd4da75f2ec0b1106e04f4b15640d039bcdb9e5)
+---
+ hscontrol/mapper/batcher.go                   |   3 +
+ hscontrol/mapper/batcher_test.go              | 152 +++++++++++++
+ hscontrol/mapper/batcher_unit_test.go         |  83 +++++++
+ hscontrol/mapper/builder.go                   |  13 +-
+ hscontrol/mapper/mapper.go                    |   3 +-
+ hscontrol/mapper/node_conn.go                 |  25 ++-
+ hscontrol/noise.go                            |  89 ++++----
+ hscontrol/noise_test.go                       | 171 +++++++++++---
+ hscontrol/policy/pm.go                        |   7 +-
+ hscontrol/policy/policy_test.go               |   2 +-
+ hscontrol/policy/v2/filter.go                 |   8 +-
+ hscontrol/policy/v2/filter_test.go            |  94 +++++++-
+ hscontrol/policy/v2/policy.go                 |  71 +++++-
+ hscontrol/policy/v2/policy_test.go            |  59 ++++-
+ .../v2/tailscale_ssh_data_compat_test.go      | 208 +++++++++++++++++-
+ hscontrol/servertest/policy_test.go           |  64 ++++++
+ hscontrol/servertest/sshcheck_test.go         | 126 ++++++++++-
+ hscontrol/state/state.go                      |  22 +-
+ integration/route_test.go                     |  13 +-
+ integration/ssh_test.go                       |  96 +++++++-
+ integration/tsic/tsic.go                      |  14 ++
+ 21 files changed, 1202 insertions(+), 121 deletions(-)
+
+diff --git a/hscontrol/mapper/batcher.go b/hscontrol/mapper/batcher.go
+index 67991c8e3c..b50e6e8f96 100644
+--- a/hscontrol/mapper/batcher.go
++++ b/hscontrol/mapper/batcher.go
+@@ -348,6 +348,9 @@ func (b *Batcher) AddNode(
+ 	// and we want to avoid the race condition where the receiver isn't ready yet
+ 	select {
+ 	case c <- initialMap:
++		// Still pendingInitial, so no broadcast can race this.
++		newEntry.lastSSHPolicy.Store(initialMap.SSHPolicy)
++
+ 		// Record sent peers only after confirmed delivery, mirroring the async
+ 		// path, and under workMu so a concurrent async bundle for this node
+ 		// cannot interleave its own lastSentPeers update.
+diff --git a/hscontrol/mapper/batcher_test.go b/hscontrol/mapper/batcher_test.go
+index 6ea74228d8..86bf496148 100644
+--- a/hscontrol/mapper/batcher_test.go
++++ b/hscontrol/mapper/batcher_test.go
+@@ -1,6 +1,7 @@
+ package mapper
+ 
+ import (
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"net/netip"
+@@ -13,6 +14,7 @@ import (
+ 
+ 	"github.com/juanfont/headscale/hscontrol/db"
+ 	"github.com/juanfont/headscale/hscontrol/derp"
++	"github.com/juanfont/headscale/hscontrol/policy"
+ 	"github.com/juanfont/headscale/hscontrol/state"
+ 	"github.com/juanfont/headscale/hscontrol/types"
+ 	"github.com/juanfont/headscale/hscontrol/types/change"
+@@ -2337,6 +2339,55 @@ func TestAddWorkFullUpdateUnaffectedByEmpty(t *testing.T) {
+ 	}
+ }
+ 
++var errInjectedSSHPolicy = errors.New("injected SSH policy failure")
++
++type failingSSHPolicyManager struct {
++	policy.PolicyManager
++}
++
++func (failingSSHPolicyManager) SSHPolicy(string, types.NodeView) (*tailcfg.SSHPolicy, error) {
++	return nil, errInjectedSSHPolicy
++}
++
++// TestSSHPolicyEmptyOnWire pins that a node without SSH rules, or whose SSH
++// policy fails to compile, gets "SSHPolicy":{"rules":[]}. A nil SSHPolicy
++// leaves the client's previous rules in force.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHPolicyEmptyOnWire(t *testing.T) {
++	for name, failCompile := range map[string]bool{
++		"no ssh rules":  false,
++		"compile error": true,
++	} {
++		t.Run(name, func(t *testing.T) {
++			testData, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 1, 2, normalBufferSize)
++			defer cleanup()
++
++			if failCompile {
++				testData.State.WrapPolicyManagerForTest(
++					func(pm policy.PolicyManager) policy.PolicyManager {
++						return failingSSHPolicyManager{PolicyManager: pm}
++					},
++				)
++			}
++
++			self := testData.Nodes[0].n.ID
++			mc := newMockNodeConnection(self)
++
++			require.NoError(t, handleNodeChange(mc, testData.Batcher.mapper, change.PolicyChange()))
++			require.NoError(t, handleNodeChange(mc, testData.Batcher.mapper, change.FullSelf(self)))
++
++			sent := mc.getSent()
++			require.Len(t, sent, 2)
++
++			for _, resp := range sent {
++				wire, err := json.Marshal(resp)
++				require.NoError(t, err)
++				assert.Contains(t, string(wire), `"SSHPolicy":{"rules":[]}`)
++			}
++		})
++	}
++}
++
+ // TestAddWorkPeersRemovedNotTreatedAsEmpty ensures the empty filter does
+ // not swallow a PeersRemoved change — deletion cleanup must still run, and
+ // surviving recipients must still see the removal.
+@@ -2702,3 +2753,104 @@ func TestDNSConfigOnlyWithSelfRefresh(t *testing.T) {
+ 	assert.Nil(t, sent[0].DNSConfig, "policy response must not carry DNSConfig")
+ 	assert.NotNil(t, sent[1].DNSConfig, "self refresh must carry DNSConfig")
+ }
++
++// TestSSHPolicySentOnlyWhenChanged pins that policy frames drop an SSHPolicy
++// the client already holds, since any non-nil SSHPolicy forces a full client
++// netmap rebuild, while initial maps and real changes still carry it.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHPolicySentOnlyWhenChanged(t *testing.T) {
++	testData, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 1, 2, normalBufferSize)
++	defer cleanup()
++
++	b := testData.Batcher.Batcher
++	self := &testData.Nodes[0]
++
++	policy := func(sshUser, group string) []byte {
++		ssh := ""
++		if sshUser != "" {
++			ssh = fmt.Sprintf(`, "ssh": [{
++				"action": "accept",
++				"src":    ["autogroup:member"],
++				"dst":    ["autogroup:self"],
++				"users":  [%q]
++			}]`, sshUser)
++		}
++
++		return fmt.Appendf(nil, `{
++			"groups": {%q: []},
++			"acls":   [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]%s
++		}`, "group:"+group, ssh)
++	}
++
++	_, err := testData.State.SetPolicy(policy("root", "a"))
++	require.NoError(t, err)
++
++	require.NoError(t, b.AddNode(self.n.ID, self.ch, tailcfg.CapabilityVersion(100), nil))
++
++	initial := expectReceive(t, self.ch, "initial map")
++	require.NotNil(t, initial.SSHPolicy)
++	require.NotEmpty(t, initial.SSHPolicy.Rules)
++
++	nc, ok := b.nodes.Load(self.n.ID)
++	require.True(t, ok)
++
++	policyFrame := func(chs ...chan *tailcfg.MapResponse) []*tailcfg.MapResponse {
++		nc.workMu.Lock()
++		defer nc.workMu.Unlock()
++
++		require.NoError(t, handleNodeChange(nc, b.mapper, change.PolicyChange()))
++
++		frames := make([]*tailcfg.MapResponse, 0, len(chs))
++		for _, ch := range chs {
++			frames = append(frames, expectReceive(t, ch, "policy frame"))
++		}
++
++		return frames
++	}
++
++	steps := []struct {
++		name     string
++		policy   []byte // nil: no policy change
++		wantSent bool
++		wantSSH  bool
++	}{
++		{"nothing changed", nil, false, false},
++		{"acl-only change", policy("root", "b"), false, false},
++		{"ssh users changed", policy("alice", "b"), true, true},
++		{"ssh removed", policy("", "b"), true, false},
++		{"acl-only change without ssh", policy("", "c"), false, false},
++	}
++
++	for _, step := range steps {
++		if step.policy != nil {
++			_, err := testData.State.SetPolicy(step.policy)
++			require.NoError(t, err)
++		}
++
++		frame := policyFrame(self.ch)[0]
++
++		if !step.wantSent {
++			assert.Nil(t, frame.SSHPolicy, "%s: unchanged SSHPolicy must be dropped", step.name)
++
++			_, delta := netmap.MutationsFromMapResponse(frame, time.Now())
++			assert.True(t, delta, "%s: frame must apply as a delta", step.name)
++
++			continue
++		}
++
++		require.NotNil(t, frame.SSHPolicy, "%s: changed SSHPolicy must be sent", step.name)
++		assert.Equal(t, step.wantSSH, len(frame.SSHPolicy.Rules) > 0, step.name)
++	}
++
++	// A new connection gets the policy in its initial map; afterwards both
++	// connections hold it and drop it from the next policy frame.
++	ch2 := make(chan *tailcfg.MapResponse, normalBufferSize)
++	require.NoError(t, b.AddNode(self.n.ID, ch2, tailcfg.CapabilityVersion(100), nil))
++
++	initial2 := expectReceive(t, ch2, "second connection's initial map")
++	require.NotNil(t, initial2.SSHPolicy, "every initial map must carry SSHPolicy")
++
++	for i, frame := range policyFrame(self.ch, ch2) {
++		assert.Nil(t, frame.SSHPolicy, "connection %d already holds the policy", i)
++	}
++}
+diff --git a/hscontrol/mapper/batcher_unit_test.go b/hscontrol/mapper/batcher_unit_test.go
+index 9bdc61f5db..9b8ea0b428 100644
+--- a/hscontrol/mapper/batcher_unit_test.go
++++ b/hscontrol/mapper/batcher_unit_test.go
+@@ -1237,3 +1237,86 @@ func TestRemoveConnectionAtIndex_NilsTrailingSlot(t *testing.T) {
+ 
+ 	mc.mutex.Unlock()
+ }
++
++// ============================================================================
++// SSHPolicy delta Tests
++// ============================================================================
++
++func sshPolicyForUser(user string) *tailcfg.SSHPolicy {
++	return &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{{
++		Principals: []*tailcfg.SSHPrincipal{{NodeIP: "100.64.0.1"}},
++		SSHUsers:   map[string]string{user: user},
++		Action:     &tailcfg.SSHAction{Accept: true},
++	}}}
++}
++
++func emptySSHPolicy() *tailcfg.SSHPolicy {
++	return &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
++}
++
++func TestMultiChannelSend_SSHPolicyOnlyWhenChanged(t *testing.T) {
++	tests := []struct {
++		name       string
++		last, next *tailcfg.SSHPolicy
++		wantSent   bool
++	}{
++		{"unchanged empty", emptySSHPolicy(), emptySSHPolicy(), false},
++		{"unchanged rules", sshPolicyForUser("root"), sshPolicyForUser("root"), false},
++		{"rules removed", sshPolicyForUser("root"), emptySSHPolicy(), true},
++		{"rules changed", sshPolicyForUser("root"), sshPolicyForUser("alice"), true},
++		{"none delivered yet", nil, emptySSHPolicy(), true},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			mc := newMultiChannelNodeConn(1, nil)
++			ch := make(chan *tailcfg.MapResponse, 1)
++			entry := makeConnectionEntry("conn", ch)
++			entry.lastSSHPolicy.Store(tt.last)
++			mc.addConnection(entry)
++
++			data := testMapResponse()
++			data.PacketFilters = map[string][]tailcfg.FilterRule{"base": nil}
++			data.SSHPolicy = tt.next
++
++			require.NoError(t, mc.send(data))
++
++			got := expectReceive(t, ch, "connection should receive the response")
++			assert.Equal(t, data.PacketFilters, got.PacketFilters, "other fields must be kept")
++
++			if tt.wantSent {
++				assert.Same(t, tt.next, got.SSHPolicy)
++			} else {
++				assert.Nil(t, got.SSHPolicy)
++			}
++
++			assert.Same(t, tt.next, entry.lastSSHPolicy.Load(), "latest copy must be stored")
++			assert.Same(t, tt.next, data.SSHPolicy, "shared response must not be modified")
++		})
++	}
++}
++
++// TestMultiChannelSend_SSHPolicyPerConnection pins per-connection tracking:
++// connections of one node can hold different policies, e.g. one that missed
++// deltas while its initial map was in flight.
++func TestMultiChannelSend_SSHPolicyPerConnection(t *testing.T) {
++	mc := newMultiChannelNodeConn(1, nil)
++
++	chA := make(chan *tailcfg.MapResponse, 1)
++	chB := make(chan *tailcfg.MapResponse, 1)
++	a := makeConnectionEntry("a", chA)
++	b := makeConnectionEntry("b", chB)
++
++	a.lastSSHPolicy.Store(sshPolicyForUser("alice"))
++	b.lastSSHPolicy.Store(sshPolicyForUser("root"))
++	mc.addConnection(a)
++	mc.addConnection(b)
++
++	data := testMapResponse()
++	data.SSHPolicy = sshPolicyForUser("alice")
++
++	require.NoError(t, mc.send(data))
++
++	assert.Nil(t, expectReceive(t, chA, "a").SSHPolicy, "a already holds this policy")
++	assert.Same(t, data.SSHPolicy, expectReceive(t, chB, "b").SSHPolicy, "b holds an older policy")
++}
+diff --git a/hscontrol/mapper/builder.go b/hscontrol/mapper/builder.go
+index 2fb276d104..43f9e72f76 100644
+--- a/hscontrol/mapper/builder.go
++++ b/hscontrol/mapper/builder.go
+@@ -146,16 +146,15 @@ func (b *MapResponseBuilder) WithSSHPolicy() *MapResponseBuilder {
+ 
+ 	sshPolicy, err := b.mapper.state.SSHPolicy(node)
+ 	if err != nil {
+-		// SSH policy is optional for a node to function. Rather than fail the
+-		// whole map (leaving the node unable to connect), log and continue
+-		// without it; the node still receives a usable netmap.
+-		log.Warn().Caller().
++		// Don't fail the whole map over SSH, but fail closed: a nil
++		// SSHPolicy would leave the client's previous rules in force.
++		log.Error().Caller().
+ 			Err(err).
+ 			Uint64(zf.NodeID, node.ID().Uint64()).
+ 			Str(zf.NodeHostname, node.Hostname()).
+-			Msg("building map response: skipping SSH policy for node; node will receive a map without SSH rules")
++			Msg("building map response: compiling SSH policy failed; sending empty SSH policy")
+ 
+-		return b
++		sshPolicy = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
+ 	}
+ 
+ 	b.resp.SSHPolicy = sshPolicy
+@@ -346,6 +345,8 @@ func (b *MapResponseBuilder) Build() (*tailcfg.MapResponse, error) {
+ 		return nil, multierr.New(b.errs...)
+ 	}
+ 
++	// Dumps show the generated response; an unchanged SSHPolicy is
++	// dropped later, per connection, before it reaches the wire.
+ 	if debugDumpMapResponsePath != "" {
+ 		writeDebugMapResponse(b.resp, b.debugType, b.nodeID)
+ 	}
+diff --git a/hscontrol/mapper/mapper.go b/hscontrol/mapper/mapper.go
+index 7b8c05333d..d66c754a7a 100644
+--- a/hscontrol/mapper/mapper.go
++++ b/hscontrol/mapper/mapper.go
+@@ -322,7 +322,8 @@ func (m *mapper) selfMapResponse(
+ // [handleNodeChange]. It sends:
+ //   - PeersChanged for remaining peers (their AllowedIPs may have changed due to policy)
+ //   - Updated PacketFilters
+-//   - Updated SSHPolicy (SSH rules may reference users/groups that changed)
++//   - Updated SSHPolicy, dropped per connection when unchanged;
++//     see [connectionEntry.withSSHPolicyDelta]
+ //   - Optionally, the node's own self info (when includeSelf is true)
+ //
+ // DNSConfig is left out: it forces clients into a full netmap rebuild, and
+diff --git a/hscontrol/mapper/node_conn.go b/hscontrol/mapper/node_conn.go
+index e63ba4397f..9552d5f2a8 100644
+--- a/hscontrol/mapper/node_conn.go
++++ b/hscontrol/mapper/node_conn.go
+@@ -3,6 +3,7 @@ package mapper
+ import (
+ 	"errors"
+ 	"fmt"
++	"reflect"
+ 	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+@@ -55,6 +56,9 @@ type connectionEntry struct {
+ 	// established connection must go through [multiChannelNodeConn.send]
+ 	// to keep it current.
+ 	lastSelf atomic.Pointer[tailcfg.Node]
++
++	// lastSSHPolicy is the last non-nil policy delivered to this connection.
++	lastSSHPolicy atomic.Pointer[tailcfg.SSHPolicy]
+ }
+ 
+ // withSelfDelta returns data without its Node when this client already
+@@ -70,6 +74,21 @@ func (entry *connectionEntry) withSelfDelta(data *tailcfg.MapResponse) *tailcfg.
+ 	return &stripped
+ }
+ 
++// withSSHPolicyDelta returns data without its SSHPolicy when this client
++// already holds an equal one: any non-nil SSHPolicy forces a full client
++// netmap rebuild. Equal content arrives in fresh pointers after every
++// policy reload, so compare deeply.
++func (entry *connectionEntry) withSSHPolicyDelta(data *tailcfg.MapResponse) *tailcfg.MapResponse {
++	if data.SSHPolicy == nil || !reflect.DeepEqual(entry.lastSSHPolicy.Load(), data.SSHPolicy) {
++		return data
++	}
++
++	stripped := *data
++	stripped.SSHPolicy = nil
++
++	return &stripped
++}
++
+ // multiChannelNodeConn manages multiple concurrent connections for a single node.
+ type multiChannelNodeConn struct {
+ 	id     types.NodeID
+@@ -342,7 +361,7 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
+ 	)
+ 
+ 	for _, conn := range snapshot {
+-		err := conn.send(conn.withSelfDelta(data))
++		err := conn.send(conn.withSSHPolicyDelta(conn.withSelfDelta(data)))
+ 		if err != nil {
+ 			lastErr = err
+ 
+@@ -357,6 +376,10 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
+ 			if data.Node != nil {
+ 				conn.lastSelf.Store(data.Node)
+ 			}
++
++			if data.SSHPolicy != nil {
++				conn.lastSSHPolicy.Store(data.SSHPolicy)
++			}
+ 		}
+ 	}
+ 
+diff --git a/hscontrol/noise.go b/hscontrol/noise.go
+index 4d72bd020e..8434b86dd1 100644
+--- a/hscontrol/noise.go
++++ b/hscontrol/noise.go
+@@ -34,9 +34,6 @@ var ErrMissingURLParameter = errors.New("missing URL parameter")
+ // ErrUnsupportedURLParameterType is returned when a URL parameter has an unsupported type.
+ var ErrUnsupportedURLParameterType = errors.New("unsupported URL parameter type")
+ 
+-// ErrNoAuthSession is returned when an auth_id does not match any active auth session.
+-var ErrNoAuthSession = errors.New("no auth session found")
+-
+ // ErrSSHDstNodeNotFound is returned when the dst node id on a Noise SSH
+ // action request does not match any registered node.
+ var ErrSSHDstNodeNotFound = errors.New("ssh action: unknown dst node id")
+@@ -446,6 +443,7 @@ func (ns *noiseServer) SSHActionHandler(
+ 		req.Context(),
+ 		reqLog,
+ 		srcNodeID, dstNodeID,
++		req.URL.Query().Get("local_user"),
+ 		req.URL.Query().Get("auth_id"),
+ 	)
+ 	if err != nil {
+@@ -473,19 +471,20 @@ func (ns *noiseServer) SSHActionHandler(
+ // sshAction resolves the SSH action for the given request parameters.
+ // It returns the action to send to the client, or an [HTTPError] on failure.
+ //
+-// Three cases:
+-//  1. Initial request, auto-approved — source recently authenticated
++// Four cases:
++//  1. No check rule covers the pair — reject; the client's rule is stale.
++//  2. Initial request, auto-approved — source recently authenticated
+ //     within the check period, accept immediately.
+-//  2. Initial request, needs auth — build a [tailcfg.SSHAction.HoldAndDelegate] URL and
++//  3. Initial request, needs auth — build a [tailcfg.SSHAction.HoldAndDelegate] URL and
+ //     wait for the user to authenticate.
+-//  3. Follow-up request — an auth_id is present, wait for the auth
++//  4. Follow-up request — an auth_id is present, wait for the auth
+ //     verdict and accept or reject. A session that is gone or whose
+ //     verdict another follow-up consumed is re-decided.
+ func (ns *noiseServer) sshAction(
+ 	ctx context.Context,
+ 	reqLog zerolog.Logger,
+ 	srcNodeID, dstNodeID types.NodeID,
+-	authIDStr string,
++	localUser, authIDStr string,
+ ) (*tailcfg.SSHAction, error) {
+ 	action := tailcfg.SSHAction{
+ 		AllowAgentForwarding:      true,
+@@ -495,21 +494,28 @@ func (ns *noiseServer) sshAction(
+ 
+ 	// Look up check params from the server's own policy rather than
+ 	// trusting URL parameters, which the client could tamper with.
++	// local_user only narrows which rule applies, and it comes from dst,
++	// the node enforcing the login.
+ 	checkPeriod, checkFound := ns.headscale.state.SSHCheckParams(
+-		srcNodeID, dstNodeID,
++		srcNodeID, dstNodeID, localUser,
+ 	)
+ 
++	// Clients only call back for check rules they were sent. Without one in
++	// the current policy the client's copy is stale.
++	if !checkFound {
++		return sshActionDeny(reqLog, &action), nil
++	}
++
+ 	// Follow-up request with auth_id — wait for the auth verdict.
+ 	if authIDStr != "" {
+ 		return ns.sshActionFollowUp(
+ 			ctx, reqLog, &action, authIDStr,
+-			srcNodeID, dstNodeID,
+-			checkFound,
++			srcNodeID, dstNodeID, localUser,
+ 		)
+ 	}
+ 
+ 	// Initial request — check if auto-approval applies.
+-	if checkFound && checkPeriod > 0 {
++	if checkPeriod > 0 {
+ 		if lastAuth, ok := ns.headscale.state.GetLastSSHAuth(
+ 			srcNodeID, dstNodeID,
+ 		); ok && time.Since(lastAuth) < checkPeriod {
+@@ -525,7 +531,18 @@ func (ns *noiseServer) sshAction(
+ 	}
+ 
+ 	// No auto-approval — create an auth session and hold.
+-	return ns.sshActionHoldAndDelegate(reqLog, &action, srcNodeID, dstNodeID)
++	return ns.sshActionHoldAndDelegate(reqLog, &action, srcNodeID, dstNodeID, localUser)
++}
++
++// sshActionDeny rejects a check the current policy does not require. It is a
++// 200 Reject, not an HTTP error: tailssh retries errors for up to 30 minutes.
++func sshActionDeny(reqLog zerolog.Logger, action *tailcfg.SSHAction) *tailcfg.SSHAction {
++	action.Reject = true
++	action.Message = "# Headscale SSH: no check rule in the tailnet policy covers this connection.\n"
++
++	reqLog.Info().Caller().Msg("SSH check denied: no matching check rule")
++
++	return action
+ }
+ 
+ // sshActionHoldAndDelegate creates a new auth session bound to the
+@@ -535,11 +552,11 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
+ 	reqLog zerolog.Logger,
+ 	action *tailcfg.SSHAction,
+ 	srcNodeID, dstNodeID types.NodeID,
++	localUser string,
+ ) (*tailcfg.SSHAction, error) {
+ 	holdURL, err := url.Parse(
+ 		ns.headscale.cfg.ServerURL +
+-			"/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID" +
+-			"?local_user=$LOCAL_USER",
++			"/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID",
+ 	)
+ 	if err != nil {
+ 		return nil, NewHTTPError(
+@@ -565,7 +582,10 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
+ 
+ 	authURL := ns.headscale.authProvider.AuthURL(authID)
+ 
++	// The concrete user, not $LOCAL_USER: Encode escapes the placeholder
++	// and tailssh only expands it literally.
+ 	q := holdURL.Query()
++	q.Set("local_user", localUser)
+ 	q.Set("auth_id", authID.String())
+ 	holdURL.RawQuery = q.Encode()
+ 
+@@ -596,7 +616,7 @@ func (ns *noiseServer) sshActionFollowUp(
+ 	action *tailcfg.SSHAction,
+ 	authIDStr string,
+ 	srcNodeID, dstNodeID types.NodeID,
+-	checkFound bool,
++	localUser string,
+ ) (*tailcfg.SSHAction, error) {
+ 	authID, err := types.AuthIDFromString(authIDStr)
+ 	if err != nil {
+@@ -609,25 +629,14 @@ func (ns *noiseServer) sshActionFollowUp(
+ 
+ 	reqLog = reqLog.With().Str("auth_id", authID.String()).Logger()
+ 
+-	// The session is gone (expired, evicted, or lost on a control-plane
+-	// restart) or its verdict was already consumed. A bare error dead-ends
+-	// the client: it keeps polling this now-defunct auth_id until the SSH
+-	// connection times out. Re-delegate so a still-required check can
+-	// complete instead.
++	// A missing session or consumed verdict must never approve access.
++	// The caller checked that the policy still requires authentication;
++	// re-delegate so the client can complete a fresh check.
+ 	sessionGone := func(logMsg string) (*tailcfg.SSHAction, error) {
+-		if checkFound {
+-			reqLog.Info().Caller().
+-				Msg(logMsg)
+-
+-			return ns.sshActionHoldAndDelegate(
+-				reqLog, action, srcNodeID, dstNodeID,
+-			)
+-		}
++		reqLog.Info().Caller().Msg(logMsg)
+ 
+-		return nil, NewHTTPError(
+-			http.StatusBadRequest,
+-			"Invalid auth_id",
+-			fmt.Errorf("%w: %s", ErrNoAuthSession, authID),
++		return ns.sshActionHoldAndDelegate(
++			reqLog, action, srcNodeID, dstNodeID, localUser,
+ 		)
+ 	}
+ 
+@@ -700,15 +709,19 @@ func (ns *noiseServer) sshActionFollowUp(
+ 		return action, nil
+ 	}
+ 
++	// The policy may have changed while the user authenticated, and the
++	// client won't drop a connection still waiting on its check.
++	if _, ok := ns.headscale.state.SSHCheckParams(srcNodeID, dstNodeID, localUser); !ok {
++		return sshActionDeny(reqLog, action), nil
++	}
++
+ 	action.Accept = true
+ 
+ 	// Record the successful auth for future auto-approval.
+-	if checkFound {
+-		ns.headscale.state.SetLastSSHAuth(srcNodeID, dstNodeID)
++	ns.headscale.state.SetLastSSHAuth(srcNodeID, dstNodeID)
+ 
+-		reqLog.Trace().Caller().
+-			Msg("auth recorded for auto-approval")
+-	}
++	reqLog.Trace().Caller().
++		Msg("auth recorded for auto-approval")
+ 
+ 	return action, nil
+ }
+diff --git a/hscontrol/noise_test.go b/hscontrol/noise_test.go
+index 44e722c76f..75a20d4d5e 100644
+--- a/hscontrol/noise_test.go
++++ b/hscontrol/noise_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"net/http/httptest"
+ 	"net/url"
+ 	"strconv"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -19,6 +20,7 @@ import (
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/juanfont/headscale/hscontrol/types"
+ 	"github.com/juanfont/headscale/hscontrol/util"
++	"github.com/rs/zerolog"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 	"tailscale.com/tailcfg"
+@@ -242,13 +244,17 @@ func TestSSHActionRoute_OldPathReturns404(t *testing.T) {
+ 	}
+ }
+ 
++// sshTestLocalUser is the non-root local user the SSH action tests log in as.
++const sshTestLocalUser = "alice"
++
+ // newSSHActionRequest builds an httptest request with the chi URL params
+ // [noiseServer.SSHActionHandler] reads (src_node_id and dst_node_id), so the handler
+ // can be exercised directly without going through the chi router.
+ func newSSHActionRequest(t *testing.T, src, dst types.NodeID) *http.Request {
+ 	t.Helper()
+ 
+-	url := fmt.Sprintf("/machine/ssh/action/%d/to/%d", src.Uint64(), dst.Uint64())
++	url := fmt.Sprintf("/machine/ssh/action/%d/to/%d?local_user=%s",
++		src.Uint64(), dst.Uint64(), sshTestLocalUser)
+ 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+ 
+ 	rctx := chi.NewRouteContext()
+@@ -271,6 +277,45 @@ func putTestNodeInStore(t *testing.T, app *Headscale, user *types.User, hostname
+ 	return node
+ }
+ 
++// sshCheckPolicy subjects every same-user pair of userName's nodes to an
++// SSH check.
++func sshCheckPolicy(userName string) string {
++	return fmt.Sprintf(`{"ssh": [{
++		"action": "check",
++		"src":    [%q],
++		"dst":    ["autogroup:self"],
++		"users":  ["autogroup:nonroot"]
++	}]}`, userName+"@")
++}
++
++// putSSHCheckNodes stages one node per hostname for a new user and sets
++// [sshCheckPolicy], so the SSH action handler holds and delegates for any
++// pair of them.
++func putSSHCheckNodes(t *testing.T, app *Headscale, userName string, hostnames ...string) []*types.Node {
++	t.Helper()
++
++	user := app.state.CreateUserForTest(userName)
++	require.NoError(t, app.state.UpdatePolicyManagerUsersForTest())
++
++	nodes := make([]*types.Node, 0, len(hostnames))
++	for _, hostname := range hostnames {
++		node := app.state.CreateRegisteredNodeForTest(user, hostname)
++		node.User = user
++		app.state.PutNodeInStoreForTest(*node)
++		nodes = append(nodes, node)
++	}
++
++	require.NoError(t, app.state.UpdatePolicyManagerNodesForTest())
++
++	_, err := app.state.SetPolicy([]byte(sshCheckPolicy(userName)))
++	require.NoError(t, err)
++
++	_, checkFound := app.state.SSHCheckParams(nodes[0].ID, nodes[len(nodes)-1].ID, sshTestLocalUser)
++	require.True(t, checkFound, "test setup: nodes must be subject to an SSH check")
++
++	return nodes
++}
++
+ // TestSSHActionHandler_RejectsRogueMachineKey verifies that the SSH
+ // check action endpoint rejects a Noise session whose machine key does
+ // not match the dst node.
+@@ -335,12 +380,9 @@ func TestSSHActionFollowUp_RejectsBindingMismatch(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	app := createTestApp(t)
+-	user := app.state.CreateUserForTest("ssh-binding-user")
+-
+-	srcCached := putTestNodeInStore(t, app, user, "src-cached")
+-	dstCached := putTestNodeInStore(t, app, user, "dst-cached")
+-	srcOther := putTestNodeInStore(t, app, user, "src-other")
+-	dstOther := putTestNodeInStore(t, app, user, "dst-other")
++	nodes := putSSHCheckNodes(t, app, "ssh-binding-user",
++		"src-cached", "dst-cached", "src-other", "dst-other")
++	srcCached, dstCached, srcOther, dstOther := nodes[0], nodes[1], nodes[2], nodes[3]
+ 
+ 	// Mint an SSH-check auth request bound to (srcCached, dstCached).
+ 	authID := types.MustAuthID()
+@@ -359,8 +401,8 @@ func TestSSHActionFollowUp_RejectsBindingMismatch(t *testing.T) {
+ 	}
+ 
+ 	url := fmt.Sprintf(
+-		"/machine/ssh/action/%d/to/%d?auth_id=%s",
+-		srcOther.ID.Uint64(), dstOther.ID.Uint64(), authID.String(),
++		"/machine/ssh/action/%d/to/%d?local_user=%s&auth_id=%s",
++		srcOther.ID.Uint64(), dstOther.ID.Uint64(), sshTestLocalUser, authID.String(),
+ 	)
+ 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+ 
+@@ -411,9 +453,8 @@ func TestSSHActionHoldAndDelegate_PersistsAuthSession(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	app := createTestApp(t)
+-	user := app.state.CreateUserForTest("ssh-persist-user")
+-	src := putTestNodeInStore(t, app, user, "src-node")
+-	dst := putTestNodeInStore(t, app, user, "dst-node")
++	nodes := putSSHCheckNodes(t, app, "ssh-persist-user", "src-node", "dst-node")
++	src, dst := nodes[0], nodes[1]
+ 
+ 	ns := &noiseServer{headscale: app, machineKey: dst.MachineKey}
+ 
+@@ -438,12 +479,13 @@ func TestSSHActionHoldAndDelegate_PersistsAuthSession(t *testing.T) {
+ 	require.True(t, ok, "auth session %s must persist after HoldAndDelegate", authID)
+ }
+ 
+-// TestSSHActionHandler_RejectsMissingSessionWithoutCheck verifies that without
+-// an SSH check covering the pair, a follow-up poll for an unknown auth_id is a
+-// genuinely bogus request and is rejected. The re-delegation behaviour for a
+-// missing session (issue #3305, exercised end to end with a real client in the
+-// servertest package) applies only when the pair is still subject to a check.
+-func TestSSHActionHandler_RejectsMissingSessionWithoutCheck(t *testing.T) {
++// TestSSHActionHandler_RejectsWithoutCheck verifies that a pair no check rule
++// covers is denied with a 200 Reject on both the initial and the follow-up
++// poll. Such a call comes from a client holding a stale check rule; an HTTP
++// error would make tailssh retry for up to 30 minutes. Re-delegation for a
++// missing session (issue #3305) applies only while a check is required.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHActionHandler_RejectsWithoutCheck(t *testing.T) {
+ 	t.Parallel()
+ 
+ 	app := createTestApp(t)
+@@ -451,18 +493,88 @@ func TestSSHActionHandler_RejectsMissingSessionWithoutCheck(t *testing.T) {
+ 	src := putTestNodeInStore(t, app, user, "src-node")
+ 	dst := putTestNodeInStore(t, app, user, "dst-node")
+ 
+-	// No SSH-check policy is set, so the pair is not subject to a check.
+-	_, checkFound := app.state.SSHCheckParams(src.ID, dst.ID)
++	_, checkFound := app.state.SSHCheckParams(src.ID, dst.ID, sshTestLocalUser)
+ 	require.False(t, checkFound, "test setup: pair must not be subject to a check")
+ 
+ 	ns := &noiseServer{headscale: app, machineKey: dst.MachineKey}
+ 
+-	missing := types.MustAuthID()
++	for name, req := range map[string]*http.Request{
++		"initial":   newSSHActionRequest(t, src.ID, dst.ID),
++		"follow-up": newSSHActionFollowUpRequest(t, src.ID, dst.ID, types.MustAuthID()),
++	} {
++		rec := httptest.NewRecorder()
++		ns.SSHActionHandler(rec, req)
++		require.Equal(t, http.StatusOK, rec.Code, "%s: body=%s", name, rec.Body.String())
+ 
+-	rec := httptest.NewRecorder()
+-	ns.SSHActionHandler(rec, newSSHActionFollowUpRequest(t, src.ID, dst.ID, missing))
+-	require.Equal(t, http.StatusBadRequest, rec.Code,
+-		"a bogus auth_id with no active check must be rejected, body=%s", rec.Body.String())
++		var action tailcfg.SSHAction
++		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &action))
++		assert.True(t, action.Reject, "%s: must reject, got %+v", name, action)
++		assert.Empty(t, action.HoldAndDelegate, "%s: must not delegate", name)
++	}
++}
++
++// TestSSHActionFollowUp_RejectsVerdictAfterCheckRemoved verifies the check is
++// re-evaluated once the user authenticates: a rule removed while the login
++// prompt was open must not grant access.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHActionFollowUp_RejectsVerdictAfterCheckRemoved(t *testing.T) {
++	t.Parallel()
++
++	const userName = "ssh-verdict-user"
++
++	nonrootOnly := sshCheckPolicy(userName)
++	rootAndNonroot := strings.Replace(nonrootOnly,
++		`["autogroup:nonroot"]`, `["root", "autogroup:nonroot"]`, 1)
++
++	for name, tc := range map[string]struct {
++		after     string // policy once the user has authenticated; "" keeps it
++		localUser string
++	}{
++		"rule kept":    {"", sshTestLocalUser},
++		"rule removed": {`{}`, sshTestLocalUser},
++		// Another check rule still covers the pair, but not for root.
++		"root rule removed": {nonrootOnly, "root"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++
++			app := createTestApp(t)
++			nodes := putSSHCheckNodes(t, app, userName, "src-node", "dst-node")
++			src, dst := nodes[0], nodes[1]
++
++			_, err := app.state.SetPolicy([]byte(rootAndNonroot))
++			require.NoError(t, err)
++
++			authID := types.MustAuthID()
++			app.state.SetAuthCacheEntry(authID, types.NewSSHCheckAuthRequest(src.ID, dst.ID))
++
++			auth, ok := app.state.GetAuthCacheEntry(authID)
++			require.True(t, ok)
++			auth.FinishAuth(types.AuthVerdict{})
++
++			if tc.after != "" {
++				_, err := app.state.SetPolicy([]byte(tc.after))
++				require.NoError(t, err)
++			}
++
++			ns := &noiseServer{headscale: app, machineKey: dst.MachineKey}
++
++			// Call the follow-up directly: the verdict is already in, as if
++			// the policy changed while the user was authenticating.
++			action, err := ns.sshActionFollowUp(
++				t.Context(), zerolog.Nop(), &tailcfg.SSHAction{},
++				authID.String(), src.ID, dst.ID, tc.localUser,
++			)
++			require.NoError(t, err)
++
++			kept := tc.after == ""
++			_, recorded := app.state.GetLastSSHAuth(src.ID, dst.ID)
++
++			assert.Equal(t, kept, action.Accept, "accept, got %+v", action)
++			assert.Equal(t, !kept, action.Reject, "reject, got %+v", action)
++			assert.Equal(t, kept, recorded, "auth recorded for auto-approval")
++		})
++	}
+ }
+ 
+ // TestTS2021Route_AcceptsGETAndPOST reproduces a regression where the
+@@ -597,7 +709,7 @@ func newSSHVerdictFixture(t *testing.T) *sshVerdictFixture {
+ 	}`, user.Name+"@"))
+ 	require.NoError(t, err)
+ 
+-	period, checkFound := app.state.SSHCheckParams(ids[0], ids[1])
++	period, checkFound := app.state.SSHCheckParams(ids[0], ids[1], sshTestLocalUser)
+ 	require.True(t, checkFound, "test setup: pair must be subject to a check")
+ 	require.Zero(t, period, "test setup: checkPeriod must be always")
+ 
+@@ -736,12 +848,13 @@ func TestSSHActionFollowUp_ConsumedVerdictNotReplayed(t *testing.T) {
+ 			_, err := f.ns.headscale.state.SetPolicy([]byte(`{}`))
+ 			require.NoError(t, err)
+ 
+-			_, checkFound := f.ns.headscale.state.SSHCheckParams(f.src, f.dst)
++			_, checkFound := f.ns.headscale.state.SSHCheckParams(f.src, f.dst, sshTestLocalUser)
+ 			require.False(t, checkFound, "test setup: pair must no longer be subject to a check")
+ 
+ 			rec := f.followUp(t, authID)
+-			assert.Equal(t, http.StatusBadRequest, rec.Code,
+-				"replay without a check must be refused, body=%s", rec.Body.String())
++			action := sshActionFromRecorder(t, rec)
++			assert.True(t, action.Reject, "replay without a check must be refused")
++			assert.False(t, action.Accept, "replay without a check must never approve access")
+ 		})
+ 	}
+ }
+diff --git a/hscontrol/policy/pm.go b/hscontrol/policy/pm.go
+index 4e3d3759b6..7211b4d26a 100644
+--- a/hscontrol/policy/pm.go
++++ b/hscontrol/policy/pm.go
+@@ -21,9 +21,10 @@ type PolicyManager interface {
+ 	// BuildPeerMap constructs peer relationship maps for the given nodes
+ 	BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID
+ 	SSHPolicy(baseURL string, node types.NodeView) (*tailcfg.SSHPolicy, error)
+-	// SSHCheckParams resolves the SSH check period for a (src, dst) pair
+-	// from the current policy, avoiding trust of client-provided URL params.
+-	SSHCheckParams(srcNodeID, dstNodeID types.NodeID) (time.Duration, bool)
++	// SSHCheckParams resolves the SSH check period for src logging in to
++	// dst as localUser from the current policy, avoiding trust of
++	// client-provided URL params.
++	SSHCheckParams(srcNodeID, dstNodeID types.NodeID, localUser string) (time.Duration, bool)
+ 	SetPolicy(pol []byte) (bool, error)
+ 	// SetUsers replaces the user list. policyChanged reports whether clients
+ 	// need a policy refresh; peerMapChanged reports whether user-derived peer
+diff --git a/hscontrol/policy/policy_test.go b/hscontrol/policy/policy_test.go
+index 41312f1e1f..5a6f569778 100644
+--- a/hscontrol/policy/policy_test.go
++++ b/hscontrol/policy/policy_test.go
+@@ -459,7 +459,7 @@ func TestSSHPolicyRules(t *testing.T) {
+ 					}
+ 				]
+ 			}`,
+-			wantSSH: &tailcfg.SSHPolicy{Rules: nil},
++			wantSSH: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}},
+ 		},
+ 		{
+ 			name:       "invalid-action",
+diff --git a/hscontrol/policy/v2/filter.go b/hscontrol/policy/v2/filter.go
+index 3933d3a6cd..d4bd1d1356 100644
+--- a/hscontrol/policy/v2/filter.go
++++ b/hscontrol/policy/v2/filter.go
+@@ -269,13 +269,15 @@ func (pol *Policy) compileSSHPolicy(
+ 	node types.NodeView,
+ 	nodes views.Slice[types.NodeView],
+ ) (*tailcfg.SSHPolicy, error) {
+-	if pol == nil || pol.SSHs == nil || len(pol.SSHs) == 0 {
+-		return nil, nil //nolint:nilnil // intentional: no SSH policy when none configured
++	// Never nil: clients read a nil SSHPolicy as "keep the previous
++	// rules", so revoked access would stay. SaaS sends "rules":[].
++	if pol == nil || len(pol.SSHs) == 0 {
++		return &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}, nil
+ 	}
+ 
+ 	log.Trace().Caller().Msgf("compiling SSH policy for node %q", node.Hostname())
+ 
+-	var rules []*tailcfg.SSHRule
++	rules := []*tailcfg.SSHRule{}
+ 
+ 	for index, rule := range pol.SSHs {
+ 		var autogroupSelfDests, otherDests []Alias
+diff --git a/hscontrol/policy/v2/filter_test.go b/hscontrol/policy/v2/filter_test.go
+index f3070fe79b..29b5def404 100644
+--- a/hscontrol/policy/v2/filter_test.go
++++ b/hscontrol/policy/v2/filter_test.go
+@@ -618,7 +618,7 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
+ 					},
+ 				},
+ 			},
+-			want: &tailcfg.SSHPolicy{},
++			want: &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}},
+ 		},
+ 	}
+ 
+@@ -2753,11 +2753,35 @@ func TestIPSetToPrincipals(t *testing.T) {
+ 	}
+ }
+ 
++// overlappingSSHChecks has a localpart check rule whose self-access reaches
++// user1's own nodes ahead of an always-check root rule for the same pair.
++var overlappingSSHChecks = []byte(`{
++	"tagOwners": {"tag:server": ["user1@"]},
++	"ssh": [
++		{
++			"action": "check",
++			"checkPeriod": "12h",
++			"src": ["user1@"],
++			"dst": ["tag:server"],
++			"users": ["localpart:*@example.com"]
++		},
++		{
++			"action": "check",
++			"checkPeriod": "always",
++			"src": ["user1@"],
++			"dst": ["autogroup:self"],
++			"users": ["root"]
++		}
++	]
++}`)
++
+ func TestSSHCheckParams(t *testing.T) {
+ 	users := types.Users{
+ 		{Name: "user1", Model: gorm.Model{ID: 1}},
+ 		{Name: "user2", Model: gorm.Model{ID: 2}},
+ 	}
++	users[0].Email = "user1@example.com"
++	users[1].Email = "user2@example.com"
+ 
+ 	nodeUser1 := types.Node{
+ 		ID:       1,
+@@ -2789,6 +2813,7 @@ func TestSSHCheckParams(t *testing.T) {
+ 		policy     []byte
+ 		srcID      types.NodeID
+ 		dstID      types.NodeID
++		localUser  string // defaults to a non-root user
+ 		wantPeriod time.Duration
+ 		wantOK     bool
+ 	}{
+@@ -2936,6 +2961,66 @@ func TestSSHCheckParams(t *testing.T) {
+ 			dstID:  types.NodeID(2),
+ 			wantOK: false,
+ 		},
++		{
++			name: "root rejected by a nonroot rule",
++			policy: []byte(`{
++				"tagOwners": {"tag:server": ["user1@"]},
++				"ssh": [{
++					"action": "check",
++					"src": ["user2@"],
++					"dst": ["tag:server"],
++					"users": ["autogroup:nonroot"]
++				}]
++			}`),
++			srcID:     types.NodeID(2),
++			dstID:     types.NodeID(3),
++			localUser: "root",
++			wantOK:    false,
++		},
++		{
++			name: "literal user must match",
++			policy: []byte(`{
++				"tagOwners": {"tag:server": ["user1@"]},
++				"ssh": [{
++					"action": "check",
++					"src": ["user2@"],
++					"dst": ["tag:server"],
++					"users": ["deploy"]
++				}]
++			}`),
++			srcID:     types.NodeID(2),
++			dstID:     types.NodeID(3),
++			localUser: "other",
++			wantOK:    false,
++		},
++		{
++			// The client skips the localpart rule for root and enforces
++			// the later always-check root rule; so must the server.
++			name:       "overlapping rules: root skips localpart self-access",
++			policy:     overlappingSSHChecks,
++			srcID:      types.NodeID(1),
++			dstID:      types.NodeID(1),
++			localUser:  "root",
++			wantPeriod: 0,
++			wantOK:     true,
++		},
++		{
++			name:       "overlapping rules: localpart user gets its period",
++			policy:     overlappingSSHChecks,
++			srcID:      types.NodeID(1),
++			dstID:      types.NodeID(1),
++			localUser:  "user1",
++			wantPeriod: 12 * time.Hour,
++			wantOK:     true,
++		},
++		{
++			name:      "overlapping rules: another user's localpart is rejected",
++			policy:    overlappingSSHChecks,
++			srcID:     types.NodeID(1),
++			dstID:     types.NodeID(1),
++			localUser: "user2",
++			wantOK:    false,
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -2943,7 +3028,12 @@ func TestSSHCheckParams(t *testing.T) {
+ 			pm, err := NewPolicyManager(tt.policy, users, nodes.ViewSlice())
+ 			require.NoError(t, err)
+ 
+-			period, ok := pm.SSHCheckParams(tt.srcID, tt.dstID)
++			localUser := tt.localUser
++			if localUser == "" {
++				localUser = "alice"
++			}
++
++			period, ok := pm.SSHCheckParams(tt.srcID, tt.dstID, localUser)
+ 			assert.Equal(t, tt.wantOK, ok, "ok mismatch")
+ 
+ 			if tt.wantOK {
+diff --git a/hscontrol/policy/v2/policy.go b/hscontrol/policy/v2/policy.go
+index e686a0220d..804a9848bb 100644
+--- a/hscontrol/policy/v2/policy.go
++++ b/hscontrol/policy/v2/policy.go
+@@ -447,16 +447,18 @@ func (pm *PolicyManager) SSHPolicy(baseURL string, node types.NodeView) (*tailcf
+ 	return sshPol, nil
+ }
+ 
+-// SSHCheckParams resolves the SSH check period for a source-destination
+-// node pair by looking up the current policy. This avoids trusting URL
++// SSHCheckParams resolves the SSH check period for src logging in to dst
++// as localUser by looking up the current policy. This avoids trusting URL
+ // parameters that a client could tamper with. First-match wins across
+-// the policy's SSH rules.
++// the policy's SSH rules; a rule only matches when it lets src log in as
++// localUser, as the client does when it picks the rule.
+ //
+ // Returns (duration, true) when a matching rule is found and
+ // (0, false) when none is. A (0, true) return means the matched rule
+ // uses a zero check period (re-check every session).
+ func (pm *PolicyManager) SSHCheckParams(
+ 	srcNodeID, dstNodeID types.NodeID,
++	localUser string,
+ ) (time.Duration, bool) {
+ 	pm.mu.RLock()
+ 	defer pm.mu.RUnlock()
+@@ -503,24 +505,24 @@ func (pm *PolicyManager) SSHCheckParams(
+ 			continue
+ 		}
+ 
++		if !pm.sshRuleAllowsUser(rule, srcNode, localUser) {
++			continue
++		}
++
+ 		// Check if dst node matches any destination.
++		hasOtherDests := false
++
+ 		for _, dst := range rule.Destinations {
+ 			if ag, isAG := dst.(*AutoGroup); isAG && ag.Is(AutoGroupSelf) {
+-				// User().Valid() guards the User().ID() dereference: the
+-				// NodeStore can hold a non-tagged node with UserID set but
+-				// the User association unhydrated (nil), and IsTagged()
+-				// alone does not cover that. Mirrors filter.go's
+-				// autogroup:self guard. Without it, a tailnet client on the
+-				// Noise SSH-check path crashes the server (nil deref).
+-				if !srcNode.IsTagged() && !dstNode.IsTagged() &&
+-					srcNode.User().Valid() && dstNode.User().Valid() &&
+-					srcNode.User().ID() == dstNode.User().ID() {
++				if sshNodesShareUser(srcNode, dstNode) {
+ 					return checkPeriodFromRule(rule), true
+ 				}
+ 
+ 				continue
+ 			}
+ 
++			hasOtherDests = true
++
+ 			dstIPs, err := dst.Resolve(pm.pol, pm.users, pm.nodes)
+ 			if err != nil || dstIPs == nil {
+ 				continue
+@@ -530,11 +532,56 @@ func (pm *PolicyManager) SSHCheckParams(
+ 				return checkPeriodFromRule(rule), true
+ 			}
+ 		}
++
++		// Localpart self-access: a source outside dst still gets the rule
++		// for its own user's nodes, or itself if tagged (compileSSHPolicy).
++		if hasOtherDests && rule.Users.ContainsLocalpart() &&
++			slices.ContainsFunc(dstNode.IPs(), srcIPs.Contains) {
++			if dstNode.IsTagged() {
++				if srcNodeID == dstNodeID {
++					return checkPeriodFromRule(rule), true
++				}
++			} else if sshNodesShareUser(srcNode, dstNode) {
++				return checkPeriodFromRule(rule), true
++			}
++		}
+ 	}
+ 
+ 	return 0, false
+ }
+ 
++// sshNodesShareUser matches user-owned nodes with hydrated user associations.
++// IsTagged alone does not guard User().ID(): the NodeStore can hold a
++// non-tagged node whose UserID is set but whose User association is nil.
++func sshNodesShareUser(srcNode, dstNode types.NodeView) bool {
++	return !srcNode.IsTagged() && !dstNode.IsTagged() &&
++		srcNode.User().Valid() && dstNode.User().Valid() &&
++		srcNode.User().ID() == dstNode.User().ID()
++}
++
++// sshRuleAllowsUser reports whether rule lets src log in as localUser,
++// mirroring the SSHUsers maps compileSSHPolicy emits: root when listed,
++// other users via autogroup:nonroot or a literal name, and anyone, root
++// included, whose name is the source user's localpart.
++func (pm *PolicyManager) sshRuleAllowsUser(rule SSH, srcNode types.NodeView, localUser string) bool {
++	isRoot := localUser == "root"
++
++	switch {
++	case localUser == "":
++		return false
++	case isRoot && rule.Users.ContainsRoot(),
++		!isRoot && rule.Users.ContainsNonRoot(),
++		!isRoot && slices.Contains(rule.Users.NormalUsers(), SSHUser(localUser)):
++		return true
++	case srcNode.IsTagged() || !srcNode.User().Valid() || !rule.Users.ContainsLocalpart():
++		return false
++	}
++
++	lp, ok := resolveLocalparts(rule.Users.LocalpartEntries(), pm.users)[srcNode.User().ID()]
++
++	return ok && lp == localUser
++}
++
+ func (pm *PolicyManager) SetPolicy(polB []byte) (bool, error) {
+ 	if len(polB) == 0 {
+ 		return false, nil
+diff --git a/hscontrol/policy/v2/policy_test.go b/hscontrol/policy/v2/policy_test.go
+index 8d07c97056..3640c8fa16 100644
+--- a/hscontrol/policy/v2/policy_test.go
++++ b/hscontrol/policy/v2/policy_test.go
+@@ -391,7 +391,7 @@ func TestSSHCheckParamsUnhydratedUserNoPanic(t *testing.T) {
+ 	require.NoError(t, err)
+ 
+ 	require.NotPanics(t, func() {
+-		pm.SSHCheckParams(types.NodeID(1), types.NodeID(2))
++		pm.SSHCheckParams(types.NodeID(1), types.NodeID(2), "alice")
+ 	}, "SSHCheckParams must not panic when a non-tagged node has an unhydrated User")
+ }
+ 
+@@ -954,6 +954,61 @@ func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
+ 	require.False(t, policyChanged2, "SetPolicy should return false when policy content hasn't changed")
+ }
+ 
++// TestSSHPolicyRemovalClearsRules pins that removing every SSH rule
++// yields a non-nil, empty [tailcfg.SSHPolicy]. A nil MapResponse.SSHPolicy
++// tells the client to keep its previous rules, so returning nil leaves
++// revoked SSH access in force. SaaS sends {"rules":[]} for policies
++// without SSH rules; see the netmap in any testdata capture whose
++// policy lacks an "ssh" key.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHPolicyRemovalClearsRules(t *testing.T) {
++	users := types.Users{{Name: "user1", Email: "user1@headscale.net"}}
++	users[0].ID = 1
++
++	nodes := types.Nodes{
++		node("server", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
++		node("client", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
++	}
++	nodes[0].ID = 1
++	nodes[1].ID = 2
++
++	withSSH := `{
++		"acls": [],
++		"ssh": [{
++			"action": "accept",
++			"src":    ["autogroup:member"],
++			"dst":    ["autogroup:self"],
++			"users":  ["root"]
++		}]
++	}`
++
++	for name, without := range map[string]string{
++		"ssh key removed": `{"acls": []}`,
++		"ssh empty list":  `{"acls": [], "ssh": []}`,
++	} {
++		t.Run(name, func(t *testing.T) {
++			pm, err := NewPolicyManager([]byte(withSSH), users, nodes.ViewSlice())
++			require.NoError(t, err)
++
++			before, err := pm.SSHPolicy("", nodes[0].View())
++			require.NoError(t, err)
++			require.NotNil(t, before)
++			require.NotEmpty(t, before.Rules, "precondition: server has SSH rules")
++
++			changed, err := pm.SetPolicy([]byte(without))
++			require.NoError(t, err)
++			require.True(t, changed)
++
++			after, err := pm.SSHPolicy("", nodes[0].View())
++			require.NoError(t, err)
++			require.NotNil(t, after,
++				"nil SSHPolicy means 'unchanged' on the wire; client keeps stale rules")
++			require.NotNil(t, after.Rules, `SaaS sends "rules":[], not null`)
++			require.Empty(t, after.Rules)
++		})
++	}
++}
++
+ // TestTagPropagationToPeerMap tests that when a node's tags change,
+ // the peer map is correctly updated. This is a regression test for
+ // https://github.com/juanfont/headscale/issues/2389
+@@ -2709,7 +2764,7 @@ func TestUnregisteredUsersAreNoOp(t *testing.T) {
+ 					continue
+ 				}
+ 
+-				period, ok := pm.SSHCheckParams(n.ID, p.ID)
++				period, ok := pm.SSHCheckParams(n.ID, p.ID, "alice")
+ 				got[n.Hostname+"->"+p.Hostname+" via"] = pm.ViaRoutesForPeer(nv, p.View())
+ 				got[n.Hostname+"->"+p.Hostname+" check"] = checkParams{period, ok}
+ 			}
+diff --git a/hscontrol/policy/v2/tailscale_ssh_data_compat_test.go b/hscontrol/policy/v2/tailscale_ssh_data_compat_test.go
+index a6cb27c20b..3f39939ad3 100644
+--- a/hscontrol/policy/v2/tailscale_ssh_data_compat_test.go
++++ b/hscontrol/policy/v2/tailscale_ssh_data_compat_test.go
+@@ -8,7 +8,10 @@
+ package v2
+ 
+ import (
++	"encoding/json"
++	"fmt"
+ 	"path/filepath"
++	"slices"
+ 	"strings"
+ 	"testing"
+ 
+@@ -190,15 +193,12 @@ func TestSSHDataCompat(t *testing.T) {
+ 						nodeName,
+ 					)
+ 
+-					// Build expected SSHPolicy from the typed rules.
+-					var wantSSH *tailcfg.SSHPolicy
+-					if len(capture.SSHRules) > 0 {
+-						wantSSH = &tailcfg.SSHPolicy{Rules: capture.SSHRules}
+-					}
+-
+-					// Normalize: treat empty-rules SSHPolicy as nil
+-					if gotSSH != nil && len(gotSSH.Rules) == 0 {
+-						gotSSH = nil
++					// Nil and empty SSHPolicy differ on the wire: nil
++					// keeps the client's previous rules, empty clears
++					// them. Take presence from the captured netmap.
++					wantSSH := &tailcfg.SSHPolicy{Rules: capture.SSHRules}
++					if capture.Netmap != nil && capture.Netmap.SSHPolicy == nil {
++						wantSSH = nil
+ 					}
+ 
+ 					// Compare headscale output against Tailscale expected.
+@@ -221,6 +221,17 @@ func TestSSHDataCompat(t *testing.T) {
+ 						)
+ 					}
+ 
++					// EquateEmpty hides "rules":null vs "rules":[];
++					// pin the captured shape separately.
++					if gotSSH != nil && capture.Netmap != nil &&
++						capture.Netmap.SSHPolicy != nil {
++						assert.Equalf(t,
++							capture.Netmap.SSHPolicy.Rules == nil,
++							gotSSH.Rules == nil,
++							"%s/%s: rules null-vs-[] mismatch", tf.TestID, nodeName,
++						)
++					}
++
+ 					// Separate presence check: the fields ignored by
+ 					// the diff above must still be populated on matching
+ 					// rules. This catches regressions where headscale
+@@ -251,3 +262,182 @@ func TestSSHDataCompat(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// sshLocalUser maps sshUser to a local user the way tailssh does for one
++// rule: an exact entry wins, then "*"; "" means the rule does not apply.
++func sshLocalUser(users map[string]string, sshUser string) string {
++	local, ok := users[sshUser]
++	if !ok {
++		local = users["*"]
++	}
++
++	if local == "=" {
++		return sshUser
++	}
++
++	return local
++}
++
++// assertSSHCheckParamsMatchRules checks SSHCheckParams against check rules as
++// tailssh reads them: (src, dst, local user) must be found exactly when a
++// holdAndDelegate rule for dst lists src as a principal and maps some SSH
++// user to that local user.
++func assertSSHCheckParamsMatchRules(
++	t *testing.T,
++	pm *PolicyManager,
++	nodes types.Nodes,
++	rulesFor func(dst *types.Node) []*tailcfg.SSHRule,
++) {
++	t.Helper()
++
++	byIP := make(map[string]*types.Node)
++
++	for _, n := range nodes {
++		for _, ip := range n.IPs() {
++			byIP[ip.String()] = n
++		}
++	}
++
++	candidates := []string{"root", "nonroot-probe"}
++
++	for _, dst := range nodes {
++		for _, rule := range rulesFor(dst) {
++			for user := range rule.SSHUsers {
++				if user != "*" && !slices.Contains(candidates, user) {
++					candidates = append(candidates, user)
++				}
++			}
++		}
++	}
++
++	for _, dst := range nodes {
++		want := make(map[types.NodeID]map[string]bool)
++
++		for _, rule := range rulesFor(dst) {
++			if rule.Action == nil || rule.Action.HoldAndDelegate == "" {
++				continue
++			}
++
++			for _, p := range rule.Principals {
++				src, ok := byIP[p.NodeIP]
++				require.Truef(t, ok, "principal %q is not a node", p.NodeIP)
++
++				if want[src.ID] == nil {
++					want[src.ID] = make(map[string]bool)
++				}
++
++				for _, user := range candidates {
++					if local := sshLocalUser(rule.SSHUsers, user); local != "" {
++						want[src.ID][local] = true
++					}
++				}
++			}
++		}
++
++		for _, src := range nodes {
++			for _, user := range candidates {
++				_, got := pm.SSHCheckParams(src.ID, dst.ID, user)
++				assert.Equalf(t, want[src.ID][user], got,
++					"SSHCheckParams(%s -> %s as %s)", src.Hostname, dst.Hostname, user)
++			}
++		}
++	}
++}
++
++// TestSSHCheckParamsMatchesCaptures pins SSHCheckParams, which decides the
++// SSH check callback, to the check rules Tailscale sent.
++func TestSSHCheckParamsMatchesCaptures(t *testing.T) {
++	t.Parallel()
++
++	files, err := filepath.Glob(filepath.Join("testdata", "ssh*_results", "*.hujson"))
++	require.NoError(t, err)
++	require.NotEmpty(t, files)
++
++	users := setupSSHDataCompatUsers()
++
++	for _, file := range files {
++		tf := loadSSHTestFile(t, file)
++		if tf.Input.APIResponseCode != 200 {
++			continue
++		}
++
++		if _, skip := sshSkipReasons[tf.TestID]; skip {
++			continue
++		}
++
++		t.Run(tf.TestID, func(t *testing.T) {
++			t.Parallel()
++
++			nodes := buildGrantsNodesFromCapture(users, tf)
++
++			pm, err := NewPolicyManager(
++				[]byte(tf.Input.FullPolicy), users, nodes.ViewSlice(),
++			)
++			require.NoError(t, err)
++
++			assertSSHCheckParamsMatchRules(t, pm, nodes,
++				func(dst *types.Node) []*tailcfg.SSHRule {
++					return tf.Captures[dst.GivenName].SSHRules
++				})
++		})
++	}
++}
++
++// TestSSHCheckParamsMatchesCompiledRules pins SSHCheckParams to headscale's
++// own compiled rules for shapes the captures lack, such as a user whose
++// email localpart is root.
++func TestSSHCheckParamsMatchesCompiledRules(t *testing.T) {
++	t.Parallel()
++
++	users := types.Users{
++		{Name: "root", Email: "root@example.com"},
++		{Name: "alice", Email: "alice@example.com"},
++	}
++	users[0].ID = 1
++	users[1].ID = 2
++
++	nodes := types.Nodes{
++		node("root-1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
++		node("root-2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
++		node("alice-1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
++		node("server", "100.64.0.4", "fd7a:115c:a1e0::4", users[1]),
++	}
++	for i, n := range nodes {
++		n.ID = types.NodeID(i + 1) //nolint:gosec
++	}
++
++	nodes[3].Tags = []string{"tag:server"}
++
++	check := func(dst string, users ...string) string {
++		usersJSON, err := json.Marshal(users)
++		require.NoError(t, err)
++
++		return fmt.Sprintf(`{"action": "check", "src": ["autogroup:member"], "dst": [%q], "users": %s}`,
++			dst, usersJSON)
++	}
++
++	for name, rules := range map[string][]string{
++		"localpart on tag":            {check("tag:server", "localpart:*@example.com")},
++		"localpart on self":           {check("autogroup:self", "localpart:*@example.com")},
++		"localpart then root":         {check("tag:server", "localpart:*@example.com"), check("autogroup:self", "root")},
++		"nonroot and literal on self": {check("autogroup:self", "autogroup:nonroot", "deploy")},
++	} {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++
++			pol := fmt.Sprintf(`{"tagOwners": {"tag:server": ["alice@"]}, "ssh": [%s]}`,
++				strings.Join(rules, ","))
++
++			pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
++			require.NoError(t, err)
++
++			assertSSHCheckParamsMatchRules(t, pm, nodes,
++				func(dst *types.Node) []*tailcfg.SSHRule {
++					sshPol, err := pm.SSHPolicy("", dst.View())
++					require.NoError(t, err)
++
++					return sshPol.Rules
++				})
++		})
++	}
++}
+diff --git a/hscontrol/servertest/policy_test.go b/hscontrol/servertest/policy_test.go
+index 5bc6bc4a31..45b07d45f8 100644
+--- a/hscontrol/servertest/policy_test.go
++++ b/hscontrol/servertest/policy_test.go
+@@ -1,6 +1,7 @@
+ package servertest_test
+ 
+ import (
++	"fmt"
+ 	"net/netip"
+ 	"testing"
+ 	"time"
+@@ -129,6 +130,69 @@ func TestPolicyChanges(t *testing.T) {
+ 		}
+ 	})
+ 
++	// https://github.com/juanfont/headscale/issues/3508
++	t.Run("ssh_removal_clears_client_ssh_policy", func(t *testing.T) {
++		t.Parallel()
++		h := servertest.NewHarness(t, 2)
++
++		h.ChangePolicy(t, []byte(`{
++			"acls": [],
++			"ssh": [{
++				"action": "accept",
++				"src":    ["autogroup:member"],
++				"dst":    ["autogroup:self"],
++				"users":  ["root"]
++			}]
++		}`))
++
++		h.Client(0).WaitForCondition(t, "SSH rules present", 10*time.Second,
++			func(nm *netmap.NetworkMap) bool {
++				return nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
++			})
++
++		h.ChangePolicy(t, []byte(`{"acls": []}`))
++
++		h.Client(0).WaitForCondition(t, "SSH rules cleared", 10*time.Second,
++			func(nm *netmap.NetworkMap) bool {
++				return nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) == 0
++			})
++	})
++
++	// An unchanged SSHPolicy is dropped from policy frames; the client
++	// must keep the rules it holds.
++	t.Run("unrelated_policy_change_keeps_client_ssh_rules", func(t *testing.T) {
++		t.Parallel()
++		h := servertest.NewHarness(t, 2)
++
++		withSSH := func(group string) []byte {
++			return fmt.Appendf(nil, `{
++				"groups": {%q: []},
++				"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
++				"ssh": [{
++					"action": "accept",
++					"src":    ["autogroup:member"],
++					"dst":    ["autogroup:self"],
++					"users":  ["root"]
++				}]
++			}`, "group:"+group)
++		}
++
++		h.ChangePolicy(t, withSSH("a"))
++		h.Client(0).WaitForCondition(t, "SSH rules present", 10*time.Second,
++			func(nm *netmap.NetworkMap) bool {
++				return nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
++			})
++
++		countBefore := h.Client(0).UpdateCount()
++
++		h.ChangePolicy(t, withSSH("b"))
++		h.Client(0).WaitForCondition(t, "policy update with SSH rules kept", 10*time.Second,
++			func(nm *netmap.NetworkMap) bool {
++				return h.Client(0).UpdateCount() > countBefore &&
++					nm.SSHPolicy != nil && len(nm.SSHPolicy.Rules) > 0
++			})
++	})
++
+ 	t.Run("policy_with_multiple_users", func(t *testing.T) {
+ 		t.Parallel()
+ 
+diff --git a/hscontrol/servertest/sshcheck_test.go b/hscontrol/servertest/sshcheck_test.go
+index 4ff1ed3174..020ded5e5c 100644
+--- a/hscontrol/servertest/sshcheck_test.go
++++ b/hscontrol/servertest/sshcheck_test.go
+@@ -6,14 +6,17 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/juanfont/headscale/hscontrol/servertest"
+ 	"github.com/juanfont/headscale/hscontrol/types"
++	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 	"tailscale.com/tailcfg"
++	"tailscale.com/types/netmap"
+ )
+ 
+ // TestSSHCheckReDelegatesWhenSessionMissing exercises the fix for
+@@ -44,7 +47,7 @@ func TestSSHCheckReDelegatesWhenSessionMissing(t *testing.T) {
+ 
+ 	// Sanity: the policy must actually subject this pair to a check, otherwise
+ 	// the test would pass for the wrong reason.
+-	_, checkFound := h.Server.State().SSHCheckParams(srcID, dstID)
++	_, checkFound := h.Server.State().SSHCheckParams(srcID, dstID, sshCheckLocalUser)
+ 	require.True(t, checkFound, "test setup: (src, dst) must be subject to an SSH check")
+ 
+ 	// The dst node's first poll yields a real HoldAndDelegate carrying a real,
+@@ -71,6 +74,9 @@ func TestSSHCheckReDelegatesWhenSessionMissing(t *testing.T) {
+ 		"re-delegation must mint a fresh auth_id")
+ }
+ 
++// sshCheckLocalUser is the non-root local user the SSH-check polls log in as.
++const sshCheckLocalUser = "alice"
++
+ // pollSSHAction issues an /machine/ssh/action poll from the given node over its
+ // real Noise connection, as tailscaled does. An empty authID is the initial
+ // poll; a non-empty one is a follow-up.
+@@ -83,11 +89,20 @@ func pollSSHAction(
+ ) tailcfg.SSHAction {
+ 	t.Helper()
+ 
+-	actionURL := fmt.Sprintf("%s/machine/ssh/action/%d/to/%d", serverURL, srcID, dstID)
++	actionURL := fmt.Sprintf("%s/machine/ssh/action/%d/to/%d?local_user=%s",
++		serverURL, srcID, dstID, sshCheckLocalUser)
+ 	if authID != "" {
+-		actionURL += "?auth_id=" + authID
++		actionURL += "&auth_id=" + authID
+ 	}
+ 
++	return pollSSHActionURL(t, node, actionURL)
++}
++
++// pollSSHActionURL polls actionURL from the given node over its real Noise
++// connection.
++func pollSSHActionURL(t *testing.T, node *servertest.TestClient, actionURL string) tailcfg.SSHAction {
++	t.Helper()
++
+ 	// Noise requests are addressed with the https scheme; the control client
+ 	// routes them over the established Noise connection (mirroring how
+ 	// controlclient issues its own register/map calls).
+@@ -125,3 +140,108 @@ func authIDFromHoldURL(t *testing.T, holdURL string) types.AuthID {
+ 
+ 	return authID
+ }
++
++// TestSSHCheckRejectedAfterRuleRemoved verifies that once a check rule is
++// removed or turned into accept, a client still holding the check gets a
++// Reject on both the initial and the follow-up poll, not a hold it could
++// pass by authenticating.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHCheckRejectedAfterRuleRemoved(t *testing.T) {
++	t.Parallel()
++
++	const check = `{"ssh": [{
++		"action": "check",
++		"src":    ["harness-default@"],
++		"dst":    ["autogroup:self"],
++		"users":  ["autogroup:nonroot"]
++	}]}`
++
++	for name, after := range map[string]string{
++		"rule removed":    `{}`,
++		"check to accept": strings.Replace(check, `"check"`, `"accept"`, 1),
++	} {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++
++			h := servertest.NewHarness(t, 2)
++
++			srcID := types.NodeID(h.Client(0).Netmap().SelfNode.ID()) //nolint:gosec
++			dstID := types.NodeID(h.Client(1).Netmap().SelfNode.ID()) //nolint:gosec
++
++			h.ChangePolicy(t, []byte(check))
++
++			initial := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, "")
++			require.NotEmpty(t, initial.HoldAndDelegate, "check must hold, got %+v", initial)
++
++			authID := authIDFromHoldURL(t, initial.HoldAndDelegate)
++
++			h.ChangePolicy(t, []byte(after))
++
++			_, checkFound := h.Server.State().SSHCheckParams(srcID, dstID, sshCheckLocalUser)
++			require.False(t, checkFound, "test setup: check must be gone")
++
++			for poll, id := range map[string]string{"initial": "", "follow-up": authID.String()} {
++				action := pollSSHAction(t, h.Server.URL, h.Client(1), srcID, dstID, id)
++				assert.True(t, action.Reject, "%s poll must reject, got %+v", poll, action)
++				assert.Empty(t, action.HoldAndDelegate, "%s poll must not delegate", poll)
++			}
++		})
++	}
++}
++
++// expandHoldURL substitutes a HoldAndDelegate URL's variables literally, as
++// tailssh does before polling it.
++func expandHoldURL(holdURL string, srcID, dstID types.NodeID, localUser string) string {
++	return strings.NewReplacer(
++		"$SRC_NODE_ID", strconv.FormatUint(srcID.Uint64(), 10),
++		"$DST_NODE_ID", strconv.FormatUint(dstID.Uint64(), 10),
++		"$SSH_USER", url.QueryEscape(localUser),
++		"$LOCAL_USER", url.QueryEscape(localUser),
++	).Replace(holdURL)
++}
++
++// TestSSHCheckFollowsReturnedHoldURL walks a check the way tailssh does:
++// expand the HoldAndDelegate URL from the netmap, poll it, then poll the
++// URL the server returns. The follow-up must still carry the login user,
++// or a root-only rule denies a user who already authenticated.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHCheckFollowsReturnedHoldURL(t *testing.T) {
++	t.Parallel()
++
++	h := servertest.NewHarness(t, 2)
++
++	srcID := types.NodeID(h.Client(0).Netmap().SelfNode.ID()) //nolint:gosec
++	dstID := types.NodeID(h.Client(1).Netmap().SelfNode.ID()) //nolint:gosec
++
++	h.ChangePolicy(t, []byte(`{"ssh": [{
++		"action": "check",
++		"src":    ["harness-default@"],
++		"dst":    ["autogroup:self"],
++		"users":  ["root"]
++	}]}`))
++
++	var ruleURL string
++
++	h.Client(1).WaitForCondition(t, "check rule in netmap", 10*time.Second,
++		func(nm *netmap.NetworkMap) bool {
++			if nm.SSHPolicy == nil || len(nm.SSHPolicy.Rules) == 0 ||
++				nm.SSHPolicy.Rules[0].Action == nil {
++				return false
++			}
++
++			ruleURL = nm.SSHPolicy.Rules[0].Action.HoldAndDelegate
++
++			return ruleURL != ""
++		})
++
++	initial := pollSSHActionURL(t, h.Client(1), expandHoldURL(ruleURL, srcID, dstID, "root"))
++	require.NotEmpty(t, initial.HoldAndDelegate, "check must hold, got %+v", initial)
++
++	auth, ok := h.Server.State().GetAuthCacheEntry(authIDFromHoldURL(t, initial.HoldAndDelegate))
++	require.True(t, ok)
++	auth.FinishAuth(types.AuthVerdict{})
++
++	followUp := pollSSHActionURL(t, h.Client(1),
++		expandHoldURL(initial.HoldAndDelegate, srcID, dstID, "root"))
++	assert.True(t, followUp.Accept, "authenticated root login must be accepted, got %+v", followUp)
++}
+diff --git a/hscontrol/state/state.go b/hscontrol/state/state.go
+index b997ef0f17..48e2d16c10 100644
+--- a/hscontrol/state/state.go
++++ b/hscontrol/state/state.go
+@@ -1171,12 +1171,13 @@ func (s *State) SSHPolicy(node types.NodeView) (*tailcfg.SSHPolicy, error) {
+ 	return s.polMan.SSHPolicy(s.cfg.ServerURL, node)
+ }
+ 
+-// SSHCheckParams resolves the SSH check period for a source-destination
+-// node pair from the current policy.
++// SSHCheckParams resolves the SSH check period for src logging in to dst
++// as localUser from the current policy.
+ func (s *State) SSHCheckParams(
+ 	srcNodeID, dstNodeID types.NodeID,
++	localUser string,
+ ) (time.Duration, bool) {
+-	return s.polMan.SSHCheckParams(srcNodeID, dstNodeID)
++	return s.polMan.SSHCheckParams(srcNodeID, dstNodeID, localUser)
+ }
+ 
+ // Filter returns the current network filter rules and matches.
+@@ -1524,6 +1525,21 @@ func (s *State) DeleteNodeFromStoreForTest(id types.NodeID) {
+ 	s.nodeStore.DeleteNode(id)
+ }
+ 
++// WrapPolicyManagerForTest replaces the policy manager with wrap(current) so
++// tests can fail a single method. The [NodeStore] keeps the original manager,
++// so wrap must delegate to its argument. Call before any map is served.
++func (s *State) WrapPolicyManagerForTest(wrap func(policy.PolicyManager) policy.PolicyManager) {
++	s.polMan = wrap(s.polMan)
++}
++
++// UpdatePolicyManagerNodesForTest syncs the policy manager with the
++// [NodeStore], for tests that stage nodes with [State.PutNodeInStoreForTest].
++func (s *State) UpdatePolicyManagerNodesForTest() error {
++	_, err := s.polMan.SetNodes(s.ListNodes())
++
++	return err
++}
++
+ // CreateRegisteredNodeForTest creates a test node with allocated IPs. This is a convenience wrapper around the database layer.
+ func (s *State) CreateRegisteredNodeForTest(user *types.User, hostname ...string) *types.Node {
+ 	return s.db.CreateRegisteredNodeForTest(user, hostname...)
+diff --git a/integration/route_test.go b/integration/route_test.go
+index dd5a001c37..6d54fc4722 100644
+--- a/integration/route_test.go
++++ b/integration/route_test.go
+@@ -3648,8 +3648,11 @@ func TestHASubnetRouterPingFailover(t *testing.T) {
+ 		[]tsic.Option{
+ 			tsic.WithAcceptRoutes(),
+ 			tsic.WithPackages("iptables"),
++			tsic.WithDERPOverHTTP(),
+ 		},
+ 		hsic.WithTestName("rt-hapingfail"),
++		// The firewall matches the callback path while Noise remains encrypted.
++		hsic.WithoutTLS(),
+ 		hsic.WithHAProbing(10*time.Second, 5*time.Second),
+ 	)
+ 	requireNoErrHeadscaleEnv(t, err)
+@@ -3758,21 +3761,21 @@ func TestHASubnetRouterPingFailover(t *testing.T) {
+ 
+ 	t.Log("=== HA setup verified. Blocking ping callbacks on router 1 via iptables ===")
+ 
+-	// Block NEW outbound TCP from router 1 to headscale.
+-	// Preserves the existing Noise HTTP/2 long-poll (ESTABLISHED).
++	// Block plaintext ping callbacks, including requests on reused HTTP
++	// connections. The encrypted Noise long-poll remains available.
+ 	hsIP := headscale.GetIPInNetwork(usernet1)
+ 	iptablesAdd := []string{
+ 		"iptables", "-A", "OUTPUT",
+ 		"-d", hsIP,
+ 		"-p", "tcp", "--dport", "8080",
+-		"-m", "state", "--state", "NEW",
++		"-m", "string", "--algo", "kmp", "--string", "/machine/ping-response",
+ 		"-j", "DROP",
+ 	}
+ 
+ 	_, _, err = subRouter1.Execute(iptablesAdd)
+ 	require.NoError(t, err, "failed to add iptables rule")
+ 
+-	t.Logf("Blocked new TCP connections from %s to headscale at %s:8080",
++	t.Logf("Blocked ping callbacks from %s to headscale at %s:8080",
+ 		subRouter1.Hostname(), hsIP)
+ 
+ 	// Wait for the prober to detect the failure and trigger failover.
+@@ -3817,7 +3820,7 @@ func TestHASubnetRouterPingFailover(t *testing.T) {
+ 		"iptables", "-D", "OUTPUT",
+ 		"-d", hsIP,
+ 		"-p", "tcp", "--dport", "8080",
+-		"-m", "state", "--state", "NEW",
++		"-m", "string", "--algo", "kmp", "--string", "/machine/ping-response",
+ 		"-j", "DROP",
+ 	}
+ 
+diff --git a/integration/ssh_test.go b/integration/ssh_test.go
+index 7ed50c206e..622b49e420 100644
+--- a/integration/ssh_test.go
++++ b/integration/ssh_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"time"
+ 
+ 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
++	"github.com/juanfont/headscale/hscontrol/types"
+ 	"github.com/juanfont/headscale/integration/dockertestutil"
+ 	"github.com/juanfont/headscale/integration/hsic"
+ 	"github.com/juanfont/headscale/integration/integrationutil"
+@@ -28,7 +29,13 @@ func isSSHNoAccessStdError(stderr string) bool {
+ 		strings.Contains(stderr, "tailnet policy does not permit you to SSH")
+ }
+ 
+-func sshScenario(t *testing.T, policy *policyv2.Policy, testName string, clientsPerUser int) *Scenario {
++func sshScenario(
++	t *testing.T,
++	policy *policyv2.Policy,
++	testName string,
++	clientsPerUser int,
++	hsOpts ...hsic.Option,
++) *Scenario {
+ 	t.Helper()
+ 
+ 	spec := ScenarioSpec{
+@@ -50,8 +57,10 @@ func sshScenario(t *testing.T, policy *policyv2.Policy, testName string, clients
+ 			tsic.WithExtraCommands("adduser ssh-it-user"),
+ 			tsic.WithDockerWorkdir("/"),
+ 		},
+-		hsic.WithACLPolicy(policy),
+-		hsic.WithTestName(testName),
++		append([]hsic.Option{
++			hsic.WithACLPolicy(policy),
++			hsic.WithTestName(testName),
++		}, hsOpts...)...,
+ 	)
+ 	require.NoError(t, err)
+ 
+@@ -270,6 +279,87 @@ func TestSSHNoSSHConfigured(t *testing.T) {
+ 	}
+ }
+ 
++// TestSSHRulesRemovedDeniesAccess verifies that removing every SSH rule
++// from the policy revokes SSH that worked before, on every client version.
++// The ACL stays open so the deny can only come from the SSH policy.
++// https://github.com/juanfont/headscale/issues/3508
++func TestSSHRulesRemovedDeniesAccess(t *testing.T) {
++	IntegrationSkip(t)
++
++	pol := &policyv2.Policy{
++		Groups: policyv2.Groups{
++			policyv2.Group("group:integration-test"): []policyv2.Username{policyv2.Username("user1@")},
++		},
++		ACLs: []policyv2.ACL{
++			{
++				Action:   "accept",
++				Protocol: "tcp",
++				Sources:  []policyv2.Alias{wildcard()},
++				Destinations: []policyv2.AliasWithPorts{
++					aliasWithPorts(wildcard(), tailcfg.PortRangeAny),
++				},
++			},
++		},
++		SSHs: []policyv2.SSH{
++			{
++				Action:  "accept",
++				Sources: policyv2.SSHSrcAliases{groupp("group:integration-test")},
++				Destinations: policyv2.SSHDstAliases{
++					new(policyv2.AutoGroupMember),
++					new(policyv2.AutoGroupTagged),
++				},
++				Users: []policyv2.SSHUser{policyv2.SSHUser("ssh-it-user")},
++			},
++		},
++	}
++
++	scenario := sshScenario(t, pol, "ssh-rmrules", len(MustTestVersions),
++		hsic.WithPolicyMode(types.PolicyModeDB),
++	)
++	defer scenario.ShutdownAssertNoPanics(t)
++
++	allClients, err := scenario.ListTailscaleClients()
++	requireNoErrListClients(t, err)
++
++	user1Clients, err := scenario.ListTailscaleClients("user1")
++	requireNoErrListClients(t, err)
++
++	headscale, err := scenario.Headscale()
++	require.NoError(t, err)
++
++	for _, client := range user1Clients {
++		for _, peer := range allClients {
++			if client.Hostname() == peer.Hostname() {
++				continue
++			}
++
++			assertSSHHostname(t, client, peer)
++		}
++	}
++
++	pol.SSHs = nil
++	err = headscale.SetPolicy(pol)
++	require.NoError(t, err)
++
++	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
++		for _, client := range user1Clients {
++			for _, peer := range allClients {
++				if client.Hostname() == peer.Hostname() {
++					continue
++				}
++
++				result, stderr, err := doSSHWithoutRetry(t, client, peer)
++				assert.Error(ct, err, "%s -> %s", client.Hostname(), peer.Hostname())
++				assert.Empty(ct, result, "%s -> %s", client.Hostname(), peer.Hostname())
++				assert.True(ct, isSSHNoAccessStdError(stderr),
++					"%s -> %s: want SSH policy deny, stderr: %s",
++					client.Hostname(), peer.Hostname(), stderr)
++			}
++		}
++	}, integrationutil.PolicyPropagationTimeout, integrationutil.SlowPoll,
++		"SSH must be denied once every SSH rule is removed")
++}
++
+ func TestSSHIsBlockedInACL(t *testing.T) {
+ 	IntegrationSkip(t)
+ 
+diff --git a/integration/tsic/tsic.go b/integration/tsic/tsic.go
+index f2a6aeac0c..b6f2e58cbe 100644
+--- a/integration/tsic/tsic.go
++++ b/integration/tsic/tsic.go
+@@ -102,6 +102,7 @@ type TailscaleInContainer struct {
+ 	// optional config
+ 	caCerts           [][]byte
+ 	headscaleHostname string
++	withDERPOverHTTP  bool
+ 	withWebsocketDERP bool
+ 	withSSH           bool
+ 	withTags          []string
+@@ -165,6 +166,15 @@ func WithWebsocketDERP(enabled bool) Option {
+ 	}
+ }
+ 
++// WithDERPOverHTTP reaches the embedded DERP over plain-HTTP websockets.
++// Use with hsic.WithoutTLS so the client does not try HTTPS for DERP.
++func WithDERPOverHTTP() Option {
++	return func(tsic *TailscaleInContainer) {
++		tsic.withWebsocketDERP = true
++		tsic.withDERPOverHTTP = true
++	}
++}
++
+ // WithSSH enables SSH for the Tailscale instance.
+ func WithSSH() Option {
+ 	return func(tsic *TailscaleInContainer) {
+@@ -378,6 +388,10 @@ func New(
+ 			tailscaleOptions.Env,
+ 			fmt.Sprintf("TS_DEBUG_DERP_WS_CLIENT=%t", tsic.withWebsocketDERP),
+ 		)
++
++		if tsic.withDERPOverHTTP {
++			tailscaleOptions.Env = append(tailscaleOptions.Env, "TS_DEBUG_USE_DERP_HTTP=true")
++		}
+ 	}
+ 
+ 	tailscaleOptions.ExtraHosts = append(tailscaleOptions.ExtraHosts,

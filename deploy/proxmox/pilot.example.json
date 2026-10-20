@@ -1,0 +1,20 @@
+{
+  "node": null,
+  "vmid": null,
+  "name": "covee-pilot",
+  "disk_storage": null,
+  "snippet_storage": null,
+  "snippet_directory": null,
+  "bridge": null,
+  "network_interface": null,
+  "vlan_tag": null,
+  "ipv4_cidr": null,
+  "gateway_ipv4": null,
+  "dns_servers": [],
+  "ssh_source_cidrs": [],
+  "ssh_public_key_file": null,
+  "control_host": "covee.example.com",
+  "cores": 4,
+  "memory_mib": 8192,
+  "disk_gib": 64
+}

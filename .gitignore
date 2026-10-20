@@ -1,0 +1,13 @@
+.cache/
+data/
+dist/
+native/engine/build/
+native/apple/Covee.xcodeproj/
+*.env
+lab/results/
+lab/results.json
+lab/management-results.json
+__pycache__/
+*.pyc
+.DS_Store
+cli/internal/payload/assets/payload.tar.gz

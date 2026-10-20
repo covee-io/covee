@@ -1,0 +1,161 @@
+name: covee-portable
+
+x-hardened: &hardened
+  user: "${COVEE_UID:?prepare a dedicated non-root account}:${COVEE_GID:?prepare a dedicated non-root account}"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+  pids_limit: 128
+  cpus: 1.0
+  mem_limit: 256m
+  memswap_limit: 256m
+  stop_grace_period: 20s
+  ulimits:
+    nofile: {soft: 4096, hard: 4096}
+  logging:
+    driver: local
+    options: {max-size: "10m", max-file: "3"}
+  tmpfs:
+    - "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${COVEE_UID:?},gid=${COVEE_GID:?}"
+
+services:
+  headscale:
+    <<: *hardened
+    image: ${COVEE_HEADSCALE_IMAGE:-covee-headscale:hardened-local}
+    command: [serve, --config, /etc/headscale/config.yaml]
+    mem_limit: 1g
+    memswap_limit: 1g
+    networks: [backend, coordinator-egress]
+    ports:
+      - "${COVEE_PUBLIC_BIND:?set an explicit public bind address}:${COVEE_STUN_PORT:-3478}:3478/udp"
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${COVEE_UID:?},gid=${COVEE_GID:?}"
+      - "/var/run/headscale:rw,nosuid,nodev,noexec,size=1m,mode=0700,uid=${COVEE_UID:?},gid=${COVEE_GID:?}"
+    healthcheck:
+      test: [CMD, /headscale, --config, /etc/headscale/config.yaml, health]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    volumes:
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/headscale.yaml
+        target: /etc/headscale/config.yaml
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/initial-policy.hujson
+        target: /etc/headscale/initial-policy.hujson
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/headscale-internal.crt
+        target: /run/covee/headscale-internal.crt
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/headscale-internal.key
+        target: /run/covee/headscale-internal.key
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/secrets/oidc-client-secret
+        target: /run/secrets/oidc-client-secret
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/headscale
+        target: /var/lib/headscale
+        bind: {create_host_path: false}
+
+  management:
+    <<: *hardened
+    image: ${COVEE_MANAGEMENT_IMAGE:-covee-management:portable-local}
+    env_file: ${COVEE_DEPLOY_DIR:?}/management.env
+    networks: [backend, management-egress]
+    depends_on:
+      headscale: {condition: service_healthy}
+    volumes:
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/internal-ca.crt
+        target: /run/covee/internal-ca.crt
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/management-internal.crt
+        target: /run/covee/management-internal.crt
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/management-internal.key
+        target: /run/covee/management-internal.key
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/secrets/admin-token
+        target: /run/secrets/admin-token
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/secrets/headscale-api-key
+        target: /run/secrets/headscale-api-key
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/secrets/entra-client-secret
+        target: /run/secrets/entra-client-secret
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/management
+        target: /data
+        bind: {create_host_path: false}
+
+  ingress:
+    <<: *hardened
+    image: ${COVEE_INGRESS_IMAGE:-covee-ingress:portable-local}
+    environment:
+      COVEE_CONTROL_HOST: ${COVEE_CONTROL_HOST:?}
+      COVEE_ADMIN_HOST: ${COVEE_ADMIN_HOST:?}
+      COVEE_PUBLIC_PORT: ${COVEE_PUBLIC_PORT:-443}
+      COVEE_ADMIN_PORT: ${COVEE_ADMIN_PORT:-8444}
+    networks: [backend, edge]
+    depends_on:
+      headscale: {condition: service_healthy}
+      management: {condition: service_started}
+    ports:
+      - "${COVEE_PUBLIC_BIND:?}:${COVEE_PUBLIC_PORT:-443}:8443/tcp"
+      - "127.0.0.1:${COVEE_ADMIN_PORT:-8444}:8444/tcp"
+    volumes:
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/internal-ca.crt
+        target: /run/covee/internal-ca.crt
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/ingress-control.crt
+        target: /run/covee/ingress-control.crt
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/ingress-control.key
+        target: /run/covee/ingress-control.key
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/ingress-admin.crt
+        target: /run/covee/ingress-admin.crt
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/ingress-admin.key
+        target: /run/covee/ingress-admin.key
+        read_only: true
+        bind: {create_host_path: false}
+
+networks:
+  backend: {internal: true}
+  edge: {}
+  coordinator-egress: {}
+  management-egress: {}

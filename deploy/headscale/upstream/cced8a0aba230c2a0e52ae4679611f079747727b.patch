@@ -1,0 +1,435 @@
+From cced8a0aba230c2a0e52ae4679611f079747727b Mon Sep 17 00:00:00 2001
+From: Kristoffer Dalby <kristoffer@tailscale.com>
+Date: Wed, 30 Sep 2026 15:33:08 +0000
+Subject: [PATCH] mapper: send the logtail instruction on every full map
+
+Full maps moved to buildFromChange and lost WithDebugConfig, so no
+frame told clients to disable log upload. Enabled logtail sends nil.
+---
+ CHANGELOG.md                                |  1 +
+ docs/about/faq.md                           |  4 +
+ hscontrol/mapper/builder.go                 |  7 +-
+ hscontrol/mapper/builder_test.go            | 11 +--
+ hscontrol/mapper/initialmap_phantom_test.go | 91 +++++++++++++++++++++
+ hscontrol/mapper/mapper.go                  |  6 ++
+ hscontrol/mapper/mapper_test.go             | 84 +++++++++++++++++++
+ hscontrol/servertest/content_test.go        | 47 +++++++++++
+ hscontrol/servertest/server.go              |  8 ++
+ hscontrol/types/config.go                   | 11 +++
+ 10 files changed, 260 insertions(+), 10 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ac3a67a171..8e9bd9a538 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -132,6 +132,7 @@ clients, and how to run the same setup without Nix.
+ 
+ - A node re-registering with a spent, expired or revoked pre-auth key is now rejected if it expired or changed node key while the re-registration was in flight [#3525](https://github.com/juanfont/headscale/pull/3525)
+ - Fix a node ping being lost when a full map update is queued at the same time [#3523](https://github.com/juanfont/headscale/pull/3523)
++- Fix clients sending logs to Tailscale Inc. although `logtail.enabled` is `false`: the instruction to disable log submission was no longer sent. It now starts every client connection. A client that is also granted the `data-plane-audit-logs` node attribute turns itself off
+ 
+ ## 0.29.5 (202x-xx-xx)
+ 
+diff --git a/docs/about/faq.md b/docs/about/faq.md
+index 1dbad540c4..c6bb8cb7e2 100644
+--- a/docs/about/faq.md
++++ b/docs/about/faq.md
+@@ -206,6 +206,10 @@ Headscale, by default, instructs clients to disable log submission to the centra
+ applied by a client once it successfully connected with Headscale. See the configuration option `logtail.enabled` in the
+ [configuration file](../ref/configuration.md) for details.
+ 
++Do not grant the `https://tailscale.com/cap/data-plane-audit-logs` node attribute while `logtail.enabled` is `false`. A
++client with log submission disabled treats this attribute as "the tailnet requires logging" and turns itself off, as
++`tailscale down` would.
++
+ Alternatively, logging can also be disabled on the client side. This is independent of Headscale and opting out of
+ client logging disables log submission early during client startup. The configuration is operating system specific and
+ is usually achieved by:
+diff --git a/hscontrol/mapper/builder.go b/hscontrol/mapper/builder.go
+index 1417dc8493..4f56a93a3a 100644
+--- a/hscontrol/mapper/builder.go
++++ b/hscontrol/mapper/builder.go
+@@ -135,12 +135,9 @@ func (b *MapResponseBuilder) WithCollectServicesDisabled() *MapResponseBuilder {
+ 	return b
+ }
+ 
+-// WithDebugConfig adds debug configuration
+-// It disables log tailing if the mapper's LogTail is not enabled.
++// WithDebugConfig sets [tailcfg.MapResponse.Debug] from [types.Config.TailcfgDebug].
+ func (b *MapResponseBuilder) WithDebugConfig() *MapResponseBuilder {
+-	b.resp.Debug = &tailcfg.Debug{
+-		DisableLogTail: !b.mapper.cfg.LogTail.Enabled,
+-	}
++	b.resp.Debug = b.mapper.cfg.TailcfgDebug()
+ 
+ 	return b
+ }
+diff --git a/hscontrol/mapper/builder_test.go b/hscontrol/mapper/builder_test.go
+index 3de60c97f7..8581d835b1 100644
+--- a/hscontrol/mapper/builder_test.go
++++ b/hscontrol/mapper/builder_test.go
+@@ -101,17 +101,19 @@ func TestMapResponseBuilder_WithDebugConfig(t *testing.T) {
+ 	tests := []struct {
+ 		name           string
+ 		logTailEnabled bool
+-		expected       bool
++		expected       *tailcfg.Debug
+ 	}{
+ 		{
++			// Enabled sends no Debug, so the wire matches a server that never
++			// touches client logging.
+ 			name:           "LogTail enabled",
+ 			logTailEnabled: true,
+-			expected:       false, // DisableLogTail should be false when LogTail is enabled
++			expected:       nil,
+ 		},
+ 		{
+ 			name:           "LogTail disabled",
+ 			logTailEnabled: false,
+-			expected:       true, // DisableLogTail should be true when LogTail is disabled
++			expected:       &tailcfg.Debug{DisableLogTail: true},
+ 		},
+ 	}
+ 
+@@ -133,8 +135,7 @@ func TestMapResponseBuilder_WithDebugConfig(t *testing.T) {
+ 			builder := m.NewMapResponseBuilder(nodeID).
+ 				WithDebugConfig()
+ 
+-			require.NotNil(t, builder.resp.Debug)
+-			assert.Equal(t, tt.expected, builder.resp.Debug.DisableLogTail)
++			assert.Equal(t, tt.expected, builder.resp.Debug)
+ 			assert.False(t, builder.hasErrors())
+ 		})
+ 	}
+diff --git a/hscontrol/mapper/initialmap_phantom_test.go b/hscontrol/mapper/initialmap_phantom_test.go
+index 362bd4f1aa..bd0a991088 100644
+--- a/hscontrol/mapper/initialmap_phantom_test.go
++++ b/hscontrol/mapper/initialmap_phantom_test.go
+@@ -2,6 +2,7 @@ package mapper
+ 
+ import (
+ 	"errors"
++	"reflect"
+ 	"testing"
+ 	"time"
+ 
+@@ -130,3 +131,93 @@ func TestSyncInitialMapNoPhantomPeersOnTimeout(t *testing.T) {
+ 			len(phantom), phantom)
+ 	}
+ }
++
++// TestInitialMapCarriesDebugConfigOnEveryStream pins that the logtail
++// instruction reaches every client stream. A client applies
++// [tailcfg.Debug.DisableLogTail] only while the process lives, so every
++// AddNode's first frame (a fresh process or a second connection alike) has to
++// carry it; a later non-full frame must not.
++func TestInitialMapCarriesDebugConfigOnEveryStream(t *testing.T) {
++	for _, tt := range []struct {
++		name    string
++		logTail bool
++		want    *tailcfg.Debug
++	}{
++		{"logtail_disabled", false, &tailcfg.Debug{DisableLogTail: true}},
++		{"logtail_enabled", true, nil},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			testData, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 1, 3, normalBufferSize)
++			defer cleanup()
++
++			// Set before any AddNode queues work, so no worker reads it concurrently.
++			testData.Config.LogTail.Enabled = tt.logTail
++
++			batcher := testData.Batcher.Batcher
++			capVer := tailcfg.CapabilityVersion(100)
++
++			firstFrame := func(t *testing.T, ch chan *tailcfg.MapResponse) *tailcfg.MapResponse {
++				t.Helper()
++
++				select {
++				case resp := <-ch:
++					return resp
++				case <-time.After(5 * time.Second):
++					t.Fatal("no initial map")
++
++					return nil
++				}
++			}
++
++			for i := range testData.Nodes {
++				n := &testData.Nodes[i]
++				testData.State.Connect(n.n.ID)
++
++				err := batcher.AddNode(n.n.ID, n.ch, capVer, nil)
++				if err != nil {
++					t.Fatalf("AddNode(%d): %v", n.n.ID, err)
++				}
++
++				resp := firstFrame(t, n.ch)
++				if resp.Node == nil {
++					t.Fatalf("node %d: first frame lacks self node", n.n.ID)
++				}
++
++				if !reflect.DeepEqual(tt.want, resp.Debug) {
++					t.Errorf("node %d initial map Debug = %+v, want %+v", n.n.ID, resp.Debug, tt.want)
++				}
++			}
++
++			// A second stream for an already-connected node gets its own full map.
++			second := make(chan *tailcfg.MapResponse, normalBufferSize)
++
++			err := batcher.AddNode(testData.Nodes[0].n.ID, second, capVer, nil)
++			if err != nil {
++				t.Fatalf("AddNode second stream: %v", err)
++			}
++
++			if resp := firstFrame(t, second); !reflect.DeepEqual(tt.want, resp.Debug) {
++				t.Errorf("second stream initial map Debug = %+v, want %+v", resp.Debug, tt.want)
++			}
++
++			batcher.AddWork(change.DERPMap())
++
++			for i := range testData.Nodes {
++				n := &testData.Nodes[i]
++
++				for {
++					resp := firstFrame(t, n.ch)
++					if resp.DERPMap == nil {
++						continue
++					}
++
++					if resp.Debug != nil {
++						t.Errorf("node %d DERP frame carries Debug %+v", n.n.ID, resp.Debug)
++					}
++
++					break
++				}
++			}
++		})
++	}
++}
+diff --git a/hscontrol/mapper/mapper.go b/hscontrol/mapper/mapper.go
+index 53af3de198..f031839cbb 100644
+--- a/hscontrol/mapper/mapper.go
++++ b/hscontrol/mapper/mapper.go
+@@ -369,6 +369,12 @@ func (m *mapper) buildFromChange(
+ 		WithCapabilityVersion(capVer).
+ 		WithDebugType(changeResponseDebug)
+ 
++	// Clients forget the logtail instruction when their process restarts, and
++	// every stream opens with a full map, so full maps carry it.
++	if resp.IsFull() {
++		builder.WithDebugConfig()
++	}
++
+ 	if resp.IncludeSelf {
+ 		builder.WithSelfNode()
+ 	}
+diff --git a/hscontrol/mapper/mapper_test.go b/hscontrol/mapper/mapper_test.go
+index 7f85cc6ee6..86acf996fb 100644
+--- a/hscontrol/mapper/mapper_test.go
++++ b/hscontrol/mapper/mapper_test.go
+@@ -979,3 +979,87 @@ func TestFailedExpiryOfPrimaryAnnouncesBackup(t *testing.T) {
+ 
+ 	assert.Contains(t, backupRoutes, route, "the client must learn the backup is primary: %s", c.Type())
+ }
++
++// TestGenerateMapResponseDebugOnlyOnFullMaps pins where [tailcfg.Debug] rides:
++// on every full map (the initial map and FullUpdate renders), so a client that
++// connects or reconnects is told to stop log uploads, and on nothing else. The
++// renders run through [generateMapResponse], the path the batcher uses, so a
++// branch that bypasses buildFromChange cannot silently drop or add it.
++func TestGenerateMapResponseDebugOnlyOnFullMaps(t *testing.T) {
++	tmp := t.TempDir()
++	p4 := netip.MustParsePrefix("100.64.0.0/10")
++	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
++	cfg := &types.Config{
++		Database: types.DatabaseConfig{
++			Type:   types.DatabaseSqlite,
++			Sqlite: types.SqliteConfig{Path: tmp + "/h.db"},
++		},
++		PrefixV4:     &p4,
++		PrefixV6:     &p6,
++		IPAllocation: types.IPAllocationStrategySequential,
++		BaseDomain:   "headscale.test",
++		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
++		DERP: types.DERPConfig{
++			DERPMap: &tailcfg.DERPMap{
++				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
++			},
++		},
++		Tuning: types.Tuning{
++			NodeStoreBatchSize:    state.TestBatchSize,
++			NodeStoreBatchTimeout: state.TestBatchTimeout,
++		},
++	}
++
++	database, err := db.NewHeadscaleDatabase(cfg)
++	require.NoError(t, err)
++
++	user := database.CreateUserForTest("u1")
++	n1 := database.CreateRegisteredNodeForTest(user, "n1")
++	n2 := database.CreateRegisteredNodeForTest(user, "n2")
++	require.NoError(t, database.Close())
++
++	s, err := state.NewState(cfg)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = s.Close() })
++
++	_, err = s.SetPolicy([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
++	require.NoError(t, err)
++
++	m := &mapper{state: s, cfg: cfg}
++
++	kinds := []struct {
++		name string
++		c    change.Change
++		full bool
++	}{
++		{"full_update", change.FullUpdate(), true},
++		{"full_self", change.FullSelf(n1.ID), true},
++		{"user_removed", change.UserRemoved(), true},
++		{"self_update", change.SelfUpdate(n1.ID), false},
++		{"self_node_added", change.NodeAdded(n1.ID), false},
++		{"policy_change", change.PolicyChange(), false},
++		{"derp_map", change.DERPMap(), false},
++		{"dns_config", change.DNSConfig(), false},
++		{"peer_added", change.NodeAdded(n2.ID), false},
++		{"peer_online", change.NodeOnline(n2.ID), false},
++	}
++
++	for _, logTail := range []bool{false, true} {
++		for _, k := range kinds {
++			t.Run(fmt.Sprintf("logtail=%t/%s", logTail, k.name), func(t *testing.T) {
++				cfg.LogTail.Enabled = logTail
++
++				resps, err := generateMapResponse(newMockNodeConnection(n1.ID), m, k.c)
++				require.NoError(t, err)
++				require.Len(t, resps, 1)
++
++				var want *tailcfg.Debug
++				if k.full && !logTail {
++					want = &tailcfg.Debug{DisableLogTail: true}
++				}
++
++				assert.Equal(t, want, resps[0].Debug)
++			})
++		}
++	}
++}
+diff --git a/hscontrol/servertest/content_test.go b/hscontrol/servertest/content_test.go
+index 9faeb8e25a..b426ed1387 100644
+--- a/hscontrol/servertest/content_test.go
++++ b/hscontrol/servertest/content_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"github.com/juanfont/headscale/hscontrol/servertest"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
++	"tailscale.com/envknob"
+ 	"tailscale.com/types/netmap"
+ )
+ 
+@@ -245,3 +246,49 @@ func TestContentVerification(t *testing.T) {
+ 			"client 1 should have received updates")
+ 	})
+ }
++
++// TestLogTailDisabledOnEveryStream drives the real client, whose
++// handleDebugMessage records DisableLogTail in the process-wide
++// TS_NO_LOGS_NO_SUPPORT knob. The knob is cleared before each stream and read
++// after that stream's first netmap. Not parallel: every client in the process
++// shares the knob.
++func TestLogTailDisabledOnEveryStream(t *testing.T) {
++	const knob = "TS_NO_LOGS_NO_SUPPORT"
++
++	// Restores the knob afterwards and panics if this test is made parallel.
++	envknob.SetenvForTest(t, knob, "")
++
++	t.Run("disabled", func(t *testing.T) {
++		envknob.Setenv(knob, "")
++
++		h := servertest.NewHarness(t, 1)
++		assert.True(t, envknob.NoLogsNoSupport(),
++			"initial map must disable client log uploads")
++
++		envknob.Setenv(knob, "")
++
++		c := h.Client(0)
++		c.Reconnect(t)
++		c.WaitForUpdate(t, 10*time.Second)
++		assert.True(t, envknob.NoLogsNoSupport(),
++			"a reconnect's initial map must disable client log uploads")
++
++		envknob.Setenv(knob, "")
++		h.AddClient(t).WaitForPeers(t, 1, 10*time.Second)
++		assert.True(t, envknob.NoLogsNoSupport(),
++			"a new client's initial map must disable client log uploads")
++	})
++
++	t.Run("enabled", func(t *testing.T) {
++		envknob.Setenv(knob, "")
++
++		h := servertest.NewHarness(t, 1,
++			servertest.WithServerOptions(servertest.WithLogTailEnabled()))
++
++		c := h.Client(0)
++		c.Reconnect(t)
++		c.WaitForUpdate(t, 10*time.Second)
++		assert.False(t, envknob.NoLogsNoSupport(),
++			"logtail.enabled must leave client log uploads alone")
++	})
++}
+diff --git a/hscontrol/servertest/server.go b/hscontrol/servertest/server.go
+index 8b6cf85a17..b5badf4ff9 100644
+--- a/hscontrol/servertest/server.go
++++ b/hscontrol/servertest/server.go
+@@ -45,6 +45,7 @@ type serverConfig struct {
+ 	nodeExpiry       time.Duration
+ 	batcherWorkers   int
+ 	taildropEnabled  bool
++	logTailEnabled   bool
+ 	realListener     bool
+ 	magicDNSDomain   string
+ 	dnsResolvers     []string
+@@ -116,6 +117,12 @@ func WithDNSResolvers(addrs ...string) ServerOption {
+ 	return func(c *serverConfig) { c.dnsResolvers = addrs }
+ }
+ 
++// WithLogTailEnabled sets logtail.enabled, so the server leaves client log
++// uploads alone instead of telling clients to disable them.
++func WithLogTailEnabled() ServerOption {
++	return func(c *serverConfig) { c.logTailEnabled = true }
++}
++
+ // NewServer creates and starts a Headscale test server.
+ // The server is fully functional and accepts real Tailscale control
+ // protocol connections over Noise.
+@@ -155,6 +162,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
+ 			Mode: types.PolicyModeDB,
+ 		},
+ 		Taildrop: types.TaildropConfig{Enabled: sc.taildropEnabled},
++		LogTail:  types.LogTailConfig{Enabled: sc.logTailEnabled},
+ 		Tuning: types.Tuning{
+ 			BatchChangeDelay:               sc.batchDelay,
+ 			BatcherWorkers:                 sc.batcherWorkers,
+diff --git a/hscontrol/types/config.go b/hscontrol/types/config.go
+index 69fa376029..f15fe688b3 100644
+--- a/hscontrol/types/config.go
++++ b/hscontrol/types/config.go
+@@ -1723,6 +1723,17 @@ func (c *Config) CloneTailcfgDNSConfig() *tailcfg.DNSConfig {
+ 	return c.TailcfgDNSConfig.Clone()
+ }
+ 
++// TailcfgDebug returns the [tailcfg.Debug] for full map responses: nil when
++// logtail is enabled, leaving client log uploads as the client set them,
++// otherwise an instruction to stop uploading logs.
++func (c *Config) TailcfgDebug() *tailcfg.Debug {
++	if c.LogTail.Enabled {
++		return nil
++	}
++
++	return &tailcfg.Debug{DisableLogTail: true}
++}
++
+ // SetExtraRecords replaces the ExtraRecords of [Config.TailcfgDNSConfig]. Safe
+ // for concurrent use with [Config.CloneTailcfgDNSConfig].
+ func (c *Config) SetExtraRecords(records []tailcfg.DNSRecord) {

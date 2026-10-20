@@ -1,0 +1,13 @@
+# Example only: review together with covee-api-key.service before installing.
+[Unit]
+Description=Rotate the Covee console coordinator API credential every 12 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=12h
+RandomizedDelaySec=5min
+AccuracySec=1min
+Unit=covee-api-key.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,90 @@
+name: covee-lab
+
+x-client: &client
+  image: tailscale/tailscale:${TAILSCALE_VERSION:-v1.102.3}
+  entrypoint: ["/usr/local/bin/tailscaled"]
+  command:
+    - --tun=userspace-networking
+    - --state=/var/lib/tailscale/tailscaled.state
+    - --socket=/var/run/tailscale/tailscaled.sock
+    - --socks5-server=0.0.0.0:1055
+  environment:
+    TS_NO_LOGS_NO_SUPPORT: "true"
+    SSL_CERT_FILE: /lab-ca.crt
+  user: "0:0"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: [/tmp, /var/run/tailscale]
+  depends_on: [headscale]
+
+services:
+  headscale:
+    image: ghcr.io/juanfont/headscale:${HEADSCALE_VERSION:-0.29.4}
+    command: [serve]
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp, /var/run/headscale]
+    volumes:
+      - ./config.yaml:/etc/headscale/config.yaml:ro
+      - ../.cache/covee/lab-tls/server.crt:/etc/headscale/server.crt:ro
+      - ../.cache/covee/lab-tls/server.key:/etc/headscale/server.key:ro
+      - control-state:/var/lib/headscale
+  node1:
+    <<: *client
+    volumes: [node1-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  node2:
+    <<: *client
+    volumes: [node2-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  node3:
+    <<: *client
+    # Test-only, source-verified knob disables UDP sockets on this client.
+    environment:
+      TS_NO_LOGS_NO_SUPPORT: "true"
+      SSL_CERT_FILE: /lab-ca.crt
+      TS_DEBUG_ALWAYS_USE_DERP: "true"
+    volumes: [node3-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  node4:
+    <<: *client
+    volumes: [node4-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  node5:
+    <<: *client
+    volumes: [node5-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  node6:
+    <<: *client
+    volumes: [node6-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  node7:
+    <<: *client
+    volumes: [node7-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  node8:
+    <<: *client
+    volumes: [node8-state:/var/lib/tailscale, ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+  probe:
+    image: python:${PYTHON_IMAGE_VERSION:-3.14.0-alpine3.22}
+    command: [python3, /lab/probe.py, serve]
+    # Share only node2's isolated lab namespace: Serve can proxy to loopback
+    # without requiring SO_MARK, CAP_NET_ADMIN, or routing host traffic.
+    network_mode: service:node2
+    depends_on: [node2]
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes: [./probe.py:/lab/probe.py:ro]
+
+networks:
+  default:
+    internal: true
+
+volumes:
+  control-state:
+  node1-state:
+  node2-state:
+  node3-state:
+  node4-state:
+  node5-state:
+  node6-state:
+  node7-state:
+  node8-state:

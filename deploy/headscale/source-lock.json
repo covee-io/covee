@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "https://github.com/juanfont/headscale",
+    "version": "0.29.4",
+    "commit": "8106636c7f8d0cf8c9d4fb0beae94415069b768b",
+    "url": "https://codeload.github.com/juanfont/headscale/tar.gz/8106636c7f8d0cf8c9d4fb0beae94415069b768b",
+    "archive_sha256": "fa3477d881326a2ad2dbcfbd1f1f2685f7553b8dac9fca822d770ae747371998"
+  },
+  "toolchain": {
+    "version": "go1.26.9",
+    "verified_at": "2026-10-11",
+    "verification_url": "https://go.dev/dl/?mode=json",
+    "image": "golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c"
+  },
+  "runtime": {
+    "image": "gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3",
+    "uid": 10001,
+    "gid": 10001
+  },
+  "patches": [
+    {
+      "path": "patches/0001-upstream-security-backports.patch",
+      "sha256": "3ed9d0fa32020f8b81891ce30b1354860f1e0b4af64946a517890c665029b33f"
+    },
+    {
+      "path": "patches/0002-remove-inner-noise-metrics.patch",
+      "sha256": "e25df46983ef13e8b5d6001dd5800de80e381d42dea47f87d51687287ef32de7"
+    },
+    {
+      "path": "patches/0003-covee-sign-in-pages.patch",
+      "sha256": "75dffa1e73ed08949a45b2c9703c3d0f54e945fe1d0c9a8bd6add645e27b26ca"
+    }
+  ],
+  "upstream_provenance": [
+    {
+      "path": "upstream/01db1dec884d2aee2d249569601e203265fd6aff.patch",
+      "sha256": "d5374c1fca2a7caecb45665d0383d0eb382de4ae716bf14c6bfb285e2cb2b1af",
+      "commit": "01db1dec884d2aee2d249569601e203265fd6aff",
+      "url": "https://github.com/juanfont/headscale/commit/01db1dec884d2aee2d249569601e203265fd6aff.patch"
+    },
+    {
+      "path": "upstream/6f27bf8d7a527e3d0a94b8805caaa90d0959c067.patch",
+      "sha256": "324fe45668c7a49a6a659249ccecd83111b1d1e2dc8871378a64933afd7371b4",
+      "commit": "6f27bf8d7a527e3d0a94b8805caaa90d0959c067",
+      "url": "https://github.com/juanfont/headscale/commit/6f27bf8d7a527e3d0a94b8805caaa90d0959c067.patch"
+    },
+    {
+      "path": "upstream/77b96cbf03daca3078ea7e0712cf33f3adf9a0ff.patch",
+      "sha256": "815d521708b55c4374b72369a662793da63673a9690e71b6481fc069011695ff",
+      "commit": "77b96cbf03daca3078ea7e0712cf33f3adf9a0ff",
+      "url": "https://github.com/juanfont/headscale/commit/77b96cbf03daca3078ea7e0712cf33f3adf9a0ff.patch"
+    },
+    {
+      "path": "upstream/cced8a0aba230c2a0e52ae4679611f079747727b.patch",
+      "sha256": "8a5f7f709b7e941c0f7b77e2e79d2ad99f01eea015d8632d22480e9a8e0743e8",
+      "commit": "cced8a0aba230c2a0e52ae4679611f079747727b",
+      "url": "https://github.com/juanfont/headscale/commit/cced8a0aba230c2a0e52ae4679611f079747727b.patch"
+    }
+  ],
+  "reviewed_upstream_pulls": [
+    3517,
+    3526,
+    3522
+  ],
+  "backport_notes": [
+    "PR3517 and PR3526 implementation/tests derive from official 0.29 backport commits in draft PR3544; original fixes were reviewed and merged upstream. Draft backport status is not a release endorsement.",
+    "PR3517 performance-only SSHPolicy delta deduplication and its tests are omitted to avoid unrelated mapper prerequisites on 0.29.4; explicit empty policy and check revalidation remain.",
+    "Logtail runtime/test changes adapted to 0.29.4 fixture layout; documentation/changelog hunks omitted.",
+    "Inner Noise metrics removal and real unregistered-Noise regression are local downstream changes."
+  ],
+  "patched_tree_sha256": "30e1a2b5472e8d28194ad7d8f4b8db318dcbc42fa693b9c2e600fc59e9508534"
+}

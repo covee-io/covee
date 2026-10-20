@@ -1,0 +1,28 @@
+# Example only: edit User/Group, paths, Python and Docker access for this host.
+# Run as the same non-root account that prepared this runtime. UID 0 is rejected.
+# Access to the Docker daemon remains privileged host access.
+[Unit]
+Description=Rotate the Covee console coordinator API credential
+Wants=network-online.target
+After=network-online.target docker.service
+ConditionPathExists=/srv/covee/runtime/runtime.env
+
+[Service]
+Type=oneshot
+User=covee
+Group=covee
+WorkingDirectory=/opt/covee
+ExecStart=/usr/bin/python3 /opt/covee/scripts/deploy.py rotate-api-key --directory /srv/covee/runtime
+TimeoutStartSec=5min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/covee/runtime
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+
+# For a rootless or remote Docker daemon, explicitly configure its socket/context
+# and trust material for this account. Do not make a daemon socket world-writable.
+# Configure host monitoring for unit failure; no notification destination is set.

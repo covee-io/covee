@@ -1,0 +1,12 @@
+{
+  "override_local_dns": false,
+  "nameservers": ["9.9.9.9", "2620:fe::fe"],
+  "split": {
+    "corp.example.com": ["10.20.0.53", "10.20.1.53"],
+    "10.in-addr.arpa": ["10.20.0.53"]
+  },
+  "search_domains": ["corp.example.com"],
+  "extra_records": [
+    {"name": "grafana.mesh.example.com", "type": "A", "value": "100.64.0.3"}
+  ]
+}

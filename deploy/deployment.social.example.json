@@ -1,0 +1,41 @@
+{
+  "control_host": "covee.example.com",
+  "admin_host": "localhost",
+  "public_bind": "0.0.0.0",
+  "public_port": 443,
+  "admin_port": 8444,
+  "stun_port": 3478,
+  "dns_base_domain": "mesh.example.com",
+  "node_expiry": "30d",
+  "identity": {
+    "providers": [
+      {
+        "id": "google",
+        "kind": "google",
+        "client_id": "REPLACE.apps.googleusercontent.com",
+        "client_secret_file": "/absolute/private/path/google-client-secret"
+      },
+      {
+        "id": "apple",
+        "kind": "apple",
+        "client_id": "io.covee.signin",
+        "team_id": "REPLACEME1",
+        "key_id": "REPLACEME2",
+        "private_key_file": "/absolute/private/path/AuthKey_REPLACE.p8"
+      },
+      {
+        "id": "entra",
+        "kind": "entra",
+        "issuer": "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
+        "client_id": "22222222-2222-4222-8222-222222222222",
+        "client_secret_file": "/absolute/private/path/entra-broker-client-secret",
+        "allowed_group_ids": ["33333333-3333-4333-8333-333333333333"]
+      }
+    ],
+    "grants": []
+  },
+  "tls": {
+    "control_cert_file": "/absolute/path/to/fullchain.pem",
+    "control_key_file": "/absolute/private/path/privkey.pem"
+  }
+}

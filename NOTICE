@@ -1,0 +1,18 @@
+Covee
+Copyright 2026 Helder Feixas
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Covee builds on and includes code from these projects, each under its own
+license, which is kept with its code and in every release:
+
+- Tailscale (https://github.com/tailscale/tailscale), BSD 3-Clause License,
+  Copyright (c) 2020 Tailscale Inc & contributors.
+- Headscale (https://github.com/juanfont/headscale), BSD 3-Clause License,
+  Copyright (c) 2020, Juan Font. Covee's patches to Headscale
+  (deploy/headscale) remain under that license, whose text is in
+  deploy/headscale/LICENSE.
+- wireguard-go (https://git.zx2c4.com/wireguard-go), MIT License.
+
+Covee is not affiliated with or endorsed by Tailscale Inc. "Tailscale" is a
+trademark of Tailscale Inc.

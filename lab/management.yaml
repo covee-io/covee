@@ -1,0 +1,49 @@
+# Overlay for the isolated lab, never a production deployment specification.
+services:
+  management:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: covee-management:local
+    env_file: ../.cache/covee/management/service.env
+    environment:
+      COVEE_LISTEN: :8089
+      COVEE_PUBLIC_URL: http://127.0.0.1:8089
+      COVEE_HEADSCALE_URL: https://headscale:8080
+      COVEE_HEADSCALE_CA_FILE: /lab-ca.crt
+      COVEE_DATA_DIR: /data
+    ports: ["127.0.0.1:8089:8089"]
+    # Docker does not publish ports on the internal-only lab bridge. Only the
+    # management service joins this second bridge; VPN clients stay isolated.
+    networks: [default, console]
+    volumes:
+      - ../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro
+      - management-state:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on: [headscale]
+  check-client:
+    profiles: [verification]
+    image: tailscale/tailscale:${TAILSCALE_VERSION:-v1.102.3}
+    entrypoint: [/usr/local/bin/tailscaled]
+    command:
+      - --tun=userspace-networking
+      - --state=/tmp/tailscaled.state
+      - --socket=/var/run/tailscale/tailscaled.sock
+    environment:
+      TS_NO_LOGS_NO_SUPPORT: "true"
+      SSL_CERT_FILE: /lab-ca.crt
+    volumes: [../.cache/covee/lab-tls/ca.crt:/lab-ca.crt:ro]
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp, /var/run/tailscale]
+    depends_on: [headscale]
+
+volumes:
+  management-state:
+
+networks:
+  console:

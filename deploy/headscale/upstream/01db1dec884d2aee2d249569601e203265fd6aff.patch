@@ -1,0 +1,64 @@
+From 01db1dec884d2aee2d249569601e203265fd6aff Mon Sep 17 00:00:00 2001
+From: Kristoffer Dalby <kristoffer@tailscale.com>
+Date: Wed, 30 Sep 2026 15:33:12 +0000
+Subject: [PATCH] hscontrol: send the logtail instruction on the expired-self
+ frame
+
+It opens a deleted node's stream in place of the initial map.
+---
+ hscontrol/noise.go      |  2 ++
+ hscontrol/noise_test.go | 18 ++++++++++++++++--
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/hscontrol/noise.go b/hscontrol/noise.go
+index f09d94a378..3d90e75ef9 100644
+--- a/hscontrol/noise.go
++++ b/hscontrol/noise.go
+@@ -742,6 +742,8 @@ func (ns *noiseServer) PollNetMapHandler(
+ 					KeyExpiry: time.Unix(1, 0).UTC(),
+ 					Expired:   true,
+ 				},
++				// This frame opens the stream in place of the initial map.
++				Debug: ns.headscale.cfg.TailcfgDebug(),
+ 			}
+ 
+ 			err = writeMapResponse(writer, mapRequest.Compress, true, expired)
+diff --git a/hscontrol/noise_test.go b/hscontrol/noise_test.go
+index 817ab1f08d..acaa579070 100644
+--- a/hscontrol/noise_test.go
++++ b/hscontrol/noise_test.go
+@@ -1158,11 +1158,22 @@ func decodeMapResponse(t *testing.T, compress string, body []byte) tailcfg.MapRe
+ func TestPollNetMapHandler_DeletedNodeGetsExpiredSelf(t *testing.T) {
+ 	t.Parallel()
+ 
+-	for _, compress := range []string{"", util.ZstdCompression} {
+-		t.Run("compress="+compress, func(t *testing.T) {
++	for _, tc := range []struct {
++		compress  string
++		logTail   bool
++		wantDebug *tailcfg.Debug
++	}{
++		{"", false, &tailcfg.Debug{DisableLogTail: true}},
++		{util.ZstdCompression, false, &tailcfg.Debug{DisableLogTail: true}},
++		{"", true, nil},
++		{util.ZstdCompression, true, nil},
++	} {
++		compress := tc.compress
++		t.Run(fmt.Sprintf("compress=%s/logtail=%t", compress, tc.logTail), func(t *testing.T) {
+ 			t.Parallel()
+ 
+ 			app := createTestApp(t)
++			app.cfg.LogTail.Enabled = tc.logTail
+ 			user := app.state.CreateUserForTest("deleted-node-user")
+ 			node := putTestNodeInStore(t, app, user, "deleted-node")
+ 
+@@ -1190,6 +1201,9 @@ func TestPollNetMapHandler_DeletedNodeGetsExpiredSelf(t *testing.T) {
+ 			assert.Equal(t, time.Unix(1, 0).UTC(), resp.Node.KeyExpiry,
+ 				"a fixed ancient KeyExpiry must remain expired despite client clock skew")
+ 			assert.True(t, resp.Node.Expired)
++			// This frame starts the stream, so it must carry the logtail
++			// instruction the initial map would have.
++			assert.Equal(t, tc.wantDebug, resp.Debug)
+ 		})
+ 	}
+ }

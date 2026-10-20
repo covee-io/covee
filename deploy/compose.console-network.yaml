@@ -1,0 +1,54 @@
+# Optional overlay for runtimes whose admin console is also served inside the
+# network (deployment field console_in_network). The console node joins the
+# network as the tagged device "console" and passes connections to its port 443
+# to the gateway's console listener on 8447, which is never published. Only the
+# internal backend network is attached: the node reaches the coordinator and its
+# relay through the gateway's alias for the control host.
+services:
+  ingress:
+    environment:
+      COVEE_MESH_CONSOLE_HOST: ${COVEE_MESH_CONSOLE_HOST:?}
+
+  console-node:
+    image: ${COVEE_CONSOLE_NODE_IMAGE:-covee-console-node:portable-local}
+    environment:
+      COVEE_CONTROL_URL: https://${COVEE_CONTROL_HOST:?}
+      COVEE_CONSOLE_TARGET: ingress:8447
+      COVEE_CONSOLE_HOSTNAME: console
+      COVEE_CONSOLE_NODE_STATE: /var/lib/covee-console-node
+      COVEE_CONSOLE_NODE_AUTHKEY_FILE: /var/lib/covee-console-node/join-key
+      # Never upload logs to Tailscale's log service.
+      TS_NO_LOGS_NO_SUPPORT: "true"
+      HOME: /tmp
+    user: "${COVEE_UID:?}:${COVEE_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    pids_limit: 128
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
+    stop_grace_period: 10s
+    networks: [backend]
+    depends_on:
+      ingress: {condition: service_started}
+    healthcheck:
+      test: [CMD, /covee-console-node, -health]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    ulimits:
+      nofile: {soft: 4096, hard: 4096}
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${COVEE_UID:?},gid=${COVEE_GID:?}"
+    volumes:
+      # The device identity, and its one-time join key until it has joined.
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/console-node
+        target: /var/lib/covee-console-node
+        bind: {create_host_path: false}
