@@ -481,11 +481,12 @@ def read_source(path, *, secret=False, private=False):
 
 def cert_pair(cert, key, host):
     run(["openssl", "x509", "-in", cert, "-checkend", "86400", "-noout"])
-    host_check = run(["openssl", "x509", "-in", cert, "-checkhost", host, "-noout"])
-    # OpenSSL 3.0 reports hostname mismatches on stdout but still exits zero.
-    # Require its complete affirmative result; unknown/ambiguous output fails
+    host_check = run(["openssl", "x509", "-in", cert, "-checkhost", host, "-noout"], check=False)
+    # OpenSSL 3.0 reports hostname mismatches on stdout but still exits zero;
+    # newer builds exit nonzero. Require a zero exit and the complete affirmative
+    # result, so both report the same error; unknown/ambiguous output fails
     # closed without changing OpenSSL's SAN matching or certificate trust rules.
-    if host_check.stdout.strip() != f"Hostname {host} does match certificate".encode():
+    if host_check.returncode != 0 or host_check.stdout.strip() != f"Hostname {host} does match certificate".encode():
         raise DeploymentError("TLS certificate does not match the configured hostname")
     public_cert = run(["openssl", "x509", "-in", cert, "-pubkey", "-noout"]).stdout
     public_key = run(["openssl", "pkey", "-in", key, "-passin", "pass:", "-pubout"]).stdout

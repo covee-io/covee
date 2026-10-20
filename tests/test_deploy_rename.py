@@ -136,7 +136,7 @@ class RenameTests(unittest.TestCase):
         cases = [(("covee.example.org", "home.example.org", self.new_control_only), "must also name console.home.example.org"),
                  (("covee.home.example.org", "home.example.org", self.new), "inside the mesh DNS domain"),
                  (("covee.example.org", "covee.example.org", self.new), "separate names"),
-                 (("covee.example.org", "home.example.org", self.old), "openssl failed"),  # cert_pair: not for the new host
+                 (("covee.example.org", "home.example.org", self.old), "does not match the configured hostname"),  # cert_pair: not for the new host
                  (("Covee.example.org", "home.example.org", self.new), "lowercase")]
         for (host, domain, cert), message in cases:
             with self.subTest(host=host, domain=domain), patch.object(deploy.Runtime, "compose") as compose:
