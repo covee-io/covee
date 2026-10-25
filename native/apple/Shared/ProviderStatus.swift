@@ -11,12 +11,28 @@ struct PeerStatus: Codable, Equatable, Identifiable {
     var exitNode: Bool? = nil
     /// Local networks the peer serves as subnet router.
     var routes: [String]? = nil
+    /// The peer's operating system as it reports it, such as macOS or linux.
+    var os: String? = nil
+    /// SSH host keys a peer running Tailscale SSH publishes, in OpenSSH form.
+    /// Such a peer lets network members in without a key or password.
+    var sshHostKeys: [String]? = nil
 
     /// "iphone.mesh.example.com." -> "iphone"
     var displayName: String { name.split(separator: ".").first.map(String.init) ?? name }
     var offersExitNode: Bool { exitNodeOption == true }
     /// Local networks reachable through the peer, without its exit routes.
     var subnetRoutes: [String] { (routes ?? []).filter { $0 != "0.0.0.0/0" && $0 != "::/0" } }
+}
+
+/// One start or end of a connection, or a problem it kept running through, as
+/// the network extension recorded it.
+struct ConnectionEvent: Codable, Equatable, Identifiable {
+    /// When, as an ISO 8601 time.
+    let at: String
+    let text: String
+
+    var id: String { at + " " + text }
+    var date: Date? { try? Date(at, strategy: .iso8601) }
 }
 
 struct ProviderStatus: Codable, Equatable {
@@ -35,6 +51,12 @@ struct ProviderStatus: Codable, Equatable {
     var exitNodeApproved: Bool? = nil
     /// This device uses the routes other devices offer, such as the gateway's.
     var acceptRoutes: Bool? = nil
+    /// How recent connections started and ended, oldest first.
+    var history: [ConnectionEvent]? = nil
+    /// The memory the network extension uses now, in MB.
+    var memoryMB: Int? = nil
+    /// The coordinators this device has a saved sign-in for.
+    var networks: [KnownNetwork]? = nil
 
     static let empty = ProviderStatus(backendState: "Stopped", ips: [], peers: [], authURL: nil, error: nil)
 

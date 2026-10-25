@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -198,7 +199,10 @@ func deviceDTO(w wire) Device {
 	user := w.object("user")
 	expiry := w.str("expiry")
 	t, err := time.Parse(time.RFC3339Nano, expiry)
-	return Device{w.identifier("id"), w.str("givenName", "given_name"), w.str("name"), user.identifier("id"), user.str("name"), w.strings("ipAddresses", "ip_addresses"), w.boolean("online"), err == nil && !t.IsZero() && t.Before(time.Now()), w.str("lastSeen", "last_seen"), expiry, w.strings("tags"), w.strings("availableRoutes", "available_routes"), w.strings("approvedRoutes", "approved_routes")}
+	// A device's owner reads as the person's email, which sign-ins provide,
+	// and otherwise as their display name or account name.
+	owner := cmp.Or(user.str("email"), user.str("displayName", "display_name"), user.str("name"))
+	return Device{w.identifier("id"), w.str("givenName", "given_name"), w.str("name"), user.identifier("id"), owner, w.strings("ipAddresses", "ip_addresses"), w.boolean("online"), err == nil && !t.IsZero() && t.Before(time.Now()), w.str("lastSeen", "last_seen"), expiry, w.strings("tags"), w.strings("availableRoutes", "available_routes"), w.strings("approvedRoutes", "approved_routes")}
 }
 
 type Key struct {

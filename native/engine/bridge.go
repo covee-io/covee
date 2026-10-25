@@ -186,8 +186,9 @@ func GoCoveeAckNetwork(handle C.int64_t, generation C.uint64_t, nativeError *C.c
 			return codeInvalid
 		}
 	}
+	// A late acknowledgement is not an engine error: the wait already ended
+	// with one, and the provider decides what a refused one means.
 	if err := e.acknowledge(uint64(generation), string(message)); err != nil {
-		e.recordError(err)
 		return codeError
 	}
 	return 0

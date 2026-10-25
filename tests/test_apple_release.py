@@ -80,10 +80,12 @@ class IOSReleaseTests(unittest.TestCase):
 
     def test_build_targets_the_named_phone_with_development_signing(self):
         command = release.ios_build_command(Path("/p/Covee.xcodeproj"), Path("/o/derived"), TEAM, "202610130300", "00008000-0000000000000001")
-        for part in ("build", "Covee-iOS", "-sdk", "iphoneos", "id=00008000-0000000000000001", "-allowProvisioningUpdates",
-                     "CODE_SIGN_STYLE=Automatic", "CURRENT_PROJECT_VERSION=202610130300"):
+        for part in ("build", "Covee-iOS", "id=00008000-0000000000000001", "-allowProvisioningUpdates",
+                     "CODE_SIGN_STYLE=Automatic", "CURRENT_PROJECT_VERSION=202610130300", "-skipPackagePluginValidation"):
             self.assertIn(part, command)
         self.assertNotIn("COVEE_ENTITLEMENTS_VARIANT=-development", command)
+        # A forced SDK would also build SwiftTerm's build tool for the phone instead of this Mac.
+        self.assertNotIn("-sdk", command)
 
     def test_development_entitlements_are_accepted_and_extras_refused(self):
         release.check_ios_entitlements(self.good("io.covee.ios"), self.good("io.covee.ios.tunnel"), TEAM)

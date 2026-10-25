@@ -7,13 +7,16 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -88,6 +91,170 @@ func (h *Host) Stream(ctx context.Context, command string, stdin []byte, show io
 		return fmt.Errorf("%s@%s: %w: %s", h.User, h.Address, err, lastLines(tail.String(), 6))
 	}
 	return nil
+}
+
+// The server keeps the output of commands run apart for a week.
+const runs = "$HOME/.covee-runs"
+
+// When a session drops, Apart connects again every reconnectEvery, and gives
+// up once the server has sent nothing for reconnectFor.
+var (
+	reconnectEvery = 5 * time.Second
+	reconnectFor   = 10 * time.Minute
+)
+
+// Apart runs command on the server apart from the SSH session and returns its
+// output, standard output and error together. When show is not nil, the output
+// is also shown with an indent as it arrives. The command reads no input.
+//
+// The admin may reach the server through the network's own gateway, which a
+// restart briefly takes down. When that cuts the session, the command carries
+// on regardless, and Apart connects again and continues from where the output
+// left off.
+func (h *Host) Apart(ctx context.Context, command string, show io.Writer) ([]byte, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return nil, err
+	}
+	name := hex.EncodeToString(b)
+	var out bytes.Buffer
+	w := io.Writer(&out)
+	var shown *indent
+	if show != nil {
+		shown = &indent{w: show}
+		w = io.MultiWriter(&out, shown)
+	}
+	var errOut tailWriter
+	// The server first answers with the run's name; a session that drops
+	// before then may not have started the command at all.
+	first := &firstLine{want: name, next: w}
+	err := h.Run(ctx, startScript(name, command), nil, first, &errOut)
+	if ferr := first.flush(); err == nil {
+		err = ferr
+	}
+	if err != nil && dropped(err) && first.seen {
+		if shown != nil {
+			shown.line("(The connection to the server dropped; the command carries on there. Connecting again.)")
+		}
+		err = h.follow(ctx, name, &out, w, &errOut)
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			err = fmt.Errorf("stopped; the command may still finish on the server: %w", ctx.Err())
+		}
+		return out.Bytes(), fmt.Errorf("%s@%s: %w: %s", h.User, h.Address, err, lastLines(out.String()+errOut.String(), 6))
+	}
+	return out.Bytes(), nil
+}
+
+// follow reconnects to a command run apart and shows the rest of its output.
+func (h *Host) follow(ctx context.Context, name string, out *bytes.Buffer, w io.Writer, errOut io.Writer) error {
+	deadline := time.Now().Add(reconnectFor)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(reconnectEvery):
+		}
+		before := out.Len()
+		err := h.Run(ctx, followScript(name, out.Len()), nil, w, errOut)
+		if err == nil || !dropped(err) {
+			return err
+		}
+		if out.Len() > before {
+			deadline = time.Now().Add(reconnectFor)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the server stayed out of reach while the command runs there: %w", err)
+		}
+	}
+}
+
+// dropped reports a session that ended without the command's status: ssh
+// exits 255 for its own errors, and a command run apart never does.
+func dropped(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == 255
+}
+
+// startScript starts command in the background, with its output in a private
+// file, and follows that file. The command ignores the hangup of a dropped
+// session and holds none of its streams.
+func startScript(name, command string) string {
+	return `d=` + runs + `; f="$d/` + name + `"
+mkdir -p -m 700 "$d" && (umask 077 && : > "$f") || exit 1
+find "$d" -type f -mtime +7 -exec rm -f {} + 2>/dev/null
+(
+trap '' HUP
+(
+` + command + `
+) > "$f" 2>&1
+s=$?; [ "$s" -eq 255 ] && s=254
+echo "$s" > "$f.exit.tmp" && mv "$f.exit.tmp" "$f.exit"
+) < /dev/null > /dev/null 2>&1 &
+echo ` + name + `
+` + followLoop(0)
+}
+
+// followScript continues a command started by startScript after the first
+// offset bytes of its output.
+func followScript(name string, offset int) string {
+	return `f=` + runs + `/` + name + `
+[ -f "$f" ] || { echo "The command's output is no longer on the server" >&2; exit 253; }
+` + followLoop(offset)
+}
+
+// followLoop prints the output file as it grows, and exits with the command's
+// status once it has ended.
+func followLoop(offset int) string {
+	return `n=` + strconv.Itoa(offset) + `
+while :; do
+  if [ -f "$f.exit" ]; then ended=1; else ended=0; fi
+  size=$(wc -c < "$f") || exit 1; size=$((size))
+  if [ "$size" -gt "$n" ]; then tail -c +$((n + 1)) "$f" | head -c $((size - n)) || exit 1; n=$size; fi
+  if [ "$ended" = 1 ]; then exit "$(cat "$f.exit")"; fi
+  sleep 1
+done`
+}
+
+// firstLine passes output on, except a first line that is exactly want.
+type firstLine struct {
+	want          string
+	next          io.Writer
+	buf           []byte
+	decided, seen bool
+}
+
+func (f *firstLine) Write(p []byte) (int, error) {
+	if f.decided {
+		return f.next.Write(p)
+	}
+	f.buf = append(f.buf, p...)
+	end := bytes.IndexByte(f.buf, '\n')
+	if end < 0 && len(f.buf) <= len(f.want) {
+		return len(p), nil
+	}
+	f.decided = true
+	rest := f.buf
+	if end >= 0 && string(f.buf[:end]) == f.want {
+		f.seen, rest = true, f.buf[end+1:]
+	}
+	f.buf = nil
+	if _, err := f.next.Write(rest); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// flush passes on a short first line that never ended.
+func (f *firstLine) flush() error {
+	if f.decided || len(f.buf) == 0 {
+		return nil
+	}
+	f.decided = true
+	_, err := f.next.Write(f.buf)
+	f.buf = nil
+	return err
 }
 
 // Tunnel forwards localPort on this computer to remotePort on the server's
@@ -165,6 +332,14 @@ func (i *indent) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// line shows a note of the CLI's own on a line of its own.
+func (i *indent) line(s string) {
+	if i.mid {
+		_, _ = i.Write([]byte("\n"))
+	}
+	_, _ = i.Write([]byte(s + "\n"))
 }
 
 // tailWriter keeps the last few kilobytes for error messages.

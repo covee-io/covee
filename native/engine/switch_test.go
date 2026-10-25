@@ -123,6 +123,14 @@ func TestSwitchingCoordinatorSignsInAgainAndKeepsTheOldSignIn(t *testing.T) {
 	if len(home.AllNodes()) != 1 {
 		t.Fatalf("switching back added a device at home: %d", len(home.AllNodes()))
 	}
+	// The app offers both networks again without typing their addresses.
+	offered := map[string]bool{}
+	for _, n := range e.buildStatus(e.backend).Networks {
+		offered[n.ControlURL] = true
+	}
+	if !offered[homeURL] || !offered[officeURL] || len(offered) != 2 {
+		t.Fatalf("networks offered: %v", offered)
+	}
 }
 
 // When the sign-in expires while connected, the engine offers a new sign-in

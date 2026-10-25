@@ -445,3 +445,25 @@ test('a stale gateway save says to refresh', async () => {
   await h.document.querySelector('#gateway-dns-form').dispatch('submit'); await h.flush();
   assert.ok(h.document.querySelector('#dialog').textContent.includes('changed since this page loaded'));
 });
+
+test('people read as their names and emails, not their account IDs', async () => {
+  const users = [{ id: '1', name: 'u0a1b', displayName: 'Pat Example', email: 'pat@example.com' }, { id: '2', name: 'u2c3d', displayName: 'Covee user' }];
+  const gateway = { enabled: true, revision: 'rev-1', settings: { entries: [{ id: 'kv', label: 'Key Vault', destinations: ['10.60.7.4'], users: ['u0a1b'] }], dns: [] },
+    status: { device: { id: '12', name: 'gateway', online: true }, problem: '', routes: [{ route: '10.60.7.4/32', entries: ['kv'], offered: true, approved: true }], hosts: [], dns: { applied: true } } };
+  const respond = async path => {
+    if (path === '/api/session') return { body: { authenticated: true, csrfToken: 'csrf-fixture', permissions: { canRead: true, canWrite: true } } };
+    if (path === '/api/gateway') return { body: gateway };
+    if (path === '/api/users') return { body: { users } };
+    throw new Error('Unexpected request ' + path);
+  };
+  const page = await harness('gateway', respond);
+  const row = page.document.root.querySelectorAll('tr').find(node => node.textContent.includes('Key Vault'));
+  assert.ok(row.textContent.includes('Pat Example') && !row.textContent.includes('u0a1b'), 'the gateway names who may use an entry');
+  await page.findButton('Edit').dispatch('click'); await page.flush();
+  const people = page.document.querySelector('#gateway-people').textContent;
+  assert.ok(people.includes('Pat Example · pat@example.com') && people.includes('Covee user · u2c3d'), people);
+
+  const list = await harness('users', respond);
+  const pat = list.document.root.querySelectorAll('tr').find(node => node.textContent.includes('Pat Example'));
+  assert.ok(pat.textContent.includes('pat@example.com') && !pat.textContent.includes('u0a1b'), 'a person with an email needs no ID');
+});

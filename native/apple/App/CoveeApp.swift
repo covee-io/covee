@@ -27,6 +27,12 @@ struct CoveeApp: App {
             ClientRootView(controller: controller, initialPage: .settings)
                 .frame(width: 720, height: 600)
         }
+        WindowGroup("Terminal", id: "terminal", for: RemoteTarget.self) { $target in
+            if let target {
+                TerminalWindow(target: target, localName: controller.configuration.hostname)
+            }
+        }
+        .defaultSize(width: 820, height: 520)
         #else
         WindowGroup {
             ClientRootView(controller: controller)
@@ -57,11 +63,19 @@ private struct MenuStatusView: View {
         }
         Divider()
         if controller.active {
-            Button("Disconnect") { controller.disconnect() }.disabled(controller.isBusy)
+            Button("Disconnect") { Task { await controller.disconnect() } }.disabled(controller.isBusy)
         } else {
             Button("Connect") {
                 if (try? controller.configuration.validated()) == nil { show() }
                 else { Task { await controller.connect(authKey: "") } }
+            }.disabled(controller.isBusy)
+        }
+        let networks = controller.savedNetworks.networks.filter { !controller.active || $0.controlURL != controller.currentControlURL }
+        if !networks.isEmpty {
+            Menu(controller.active ? "Switch network" : "Connect to") {
+                ForEach(networks) { network in
+                    Button(network.host) { Task { await controller.connect(to: network) } }
+                }
             }.disabled(controller.isBusy)
         }
         if let signIn = controller.authenticationURL {
@@ -77,11 +91,20 @@ private struct MenuStatusView: View {
                     Text("No other devices you can reach")
                 }
                 ForEach(peers) { peer in
-                    Button("\(peer.online ? "●" : "○")  \(peer.displayName)  \(peer.ips.first ?? "")") { copy(peer.ips.first) }
-                }
-                if !peers.isEmpty {
-                    Divider()
-                    Text("Click a device to copy its address")
+                    let target = RemoteTarget(peer: peer)
+                    Menu("\(peer.online ? "●" : "○")  \(peer.displayName)  \(peer.ips.first ?? "")") {
+                        if target.canBeReached {
+                            Button("Open Terminal") {
+                                openWindow(id: "terminal", value: target)
+                                NSApplication.shared.activate()
+                            }.disabled(!peer.online)
+                            Button("Share Screen") {
+                                if let url = URL(string: "vnc://" + target.address) { NSWorkspace.shared.open(url) }
+                            }.disabled(!peer.online)
+                            Divider()
+                        }
+                        Button("Copy Address") { copy(peer.ips.first) }
+                    }
                 }
             }
             Menu("Exit node") {

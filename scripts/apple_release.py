@@ -61,6 +61,11 @@ FINAL_NETWORK = ["packet-tunnel-provider-systemextension"]
 NOTARY_WAIT_SECONDS = 45 * 60
 
 
+# SwiftTerm makes its version string with a package build plugin; without these
+# flags xcodebuild stops and waits for the plugin to be trusted in Xcode.
+PACKAGE_FLAGS = ["-skipPackagePluginValidation", "-skipMacroValidation"]
+
+
 class ReleaseError(RuntimeError):
     pass
 
@@ -70,15 +75,16 @@ def archive_command(project, archive, derived, team, build):
             "-destination", "generic/platform=macOS", "-archivePath", str(archive), "-derivedDataPath", str(derived),
             "-allowProvisioningUpdates", "ARCHS=arm64", "ONLY_ACTIVE_ARCH=NO",
             "CODE_SIGN_STYLE=Automatic", f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_IDENTITY=Apple Development",
-            "COVEE_ENTITLEMENTS_VARIANT=-development", f"CURRENT_PROJECT_VERSION={build}"]
+            "COVEE_ENTITLEMENTS_VARIANT=-development", f"CURRENT_PROJECT_VERSION={build}"] + PACKAGE_FLAGS
 
 
 def ios_build_command(project, derived, team, build, device):
+    # The destination picks the SDK; -sdk would also build package build tools for the phone.
     return ["xcodebuild", "build", "-project", str(project), "-scheme", "Covee-iOS", "-configuration", "Release",
-            "-sdk", "iphoneos", "-destination", f"id={device}", "-derivedDataPath", str(derived),
+            "-destination", f"id={device}", "-derivedDataPath", str(derived),
             "-allowProvisioningUpdates", "ARCHS=arm64", "ONLY_ACTIVE_ARCH=NO",
             "CODE_SIGN_STYLE=Automatic", f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_IDENTITY=Apple Development",
-            f"CURRENT_PROJECT_VERSION={build}"]
+            f"CURRENT_PROJECT_VERSION={build}"] + PACKAGE_FLAGS
 
 
 def ios_archive_command(project, archive, derived, team, build):
@@ -86,7 +92,7 @@ def ios_archive_command(project, archive, derived, team, build):
             "-destination", "generic/platform=iOS", "-archivePath", str(archive), "-derivedDataPath", str(derived),
             "-allowProvisioningUpdates", "ARCHS=arm64", "ONLY_ACTIVE_ARCH=NO",
             "CODE_SIGN_STYLE=Automatic", f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_IDENTITY=Apple Development",
-            f"CURRENT_PROJECT_VERSION={build}"]
+            f"CURRENT_PROJECT_VERSION={build}"] + PACKAGE_FLAGS
 
 
 def app_store_options(team, destination):
@@ -279,6 +285,9 @@ def release_testflight(args):
             rel.run("engine", [sys.executable, "scripts/apple.py", "engine", "--platform", "ios"])
         rel.run("generate", ["xcodegen", "generate", "--spec", str(APPLE / "project.yml"), "--project", str(APPLE)])
         rel.run("archive", ios_archive_command(APPLE / "Covee.xcodeproj", archive, out / "derived", args.team, build))
+        # The apps show these licenses; a release must carry the current list.
+        rel.run("acknowledgements", [sys.executable, "scripts/apple_acknowledgements.py", "--check",
+                                     "--checkouts", str(out / "derived/SourcePackages/checkouts")])
         options = out / "options-export.plist"
         options.write_bytes(plistlib.dumps(app_store_options(args.team, "export")))
         rel.run("export", ["xcodebuild", "-exportArchive", "-archivePath", str(archive), "-exportOptionsPlist", str(options),
@@ -338,6 +347,9 @@ def release(args):
             rel.run("engine", [sys.executable, "scripts/apple.py", "engine", "--platform", "macos"])
         rel.run("generate", ["xcodegen", "generate", "--spec", str(APPLE / "project.yml"), "--project", str(APPLE)])
         rel.run("archive", archive_command(APPLE / "Covee.xcodeproj", archive, out / "derived", args.team, build))
+        # The apps show these licenses; a release must carry the current list.
+        rel.run("acknowledgements", [sys.executable, "scripts/apple_acknowledgements.py", "--check",
+                                     "--checkouts", str(out / "derived/SourcePackages/checkouts")])
         options = out / "options-upload.plist"
         options.write_bytes(plistlib.dumps(export_options(args.team)))
         rel.run("upload-for-notarization", ["xcodebuild", "-exportArchive", "-archivePath", str(archive),

@@ -313,8 +313,8 @@ func (s *session) switchNames(ctx context.Context, srv *server, old *record.Netw
 	if err := srv.putFile(ctx, next+"privkey.pem", key, "400"); err != nil {
 		return err
 	}
-	out, err := srv.covee.Output(ctx, "cd "+serverSource+" && python3 scripts/deploy.py rename --control-host "+remote.Quote(n.Hostname)+
-		" --dns-base-domain "+remote.Quote(n.DNSBaseDomain)+" --cert "+next+"fullchain.pem --key "+next+"privkey.pem --directory "+remote.Quote(n.Runtime), nil)
+	out, err := srv.deployResult(ctx, "rename --control-host "+remote.Quote(n.Hostname)+
+		" --dns-base-domain "+remote.Quote(n.DNSBaseDomain)+" --cert "+next+"fullchain.pem --key "+next+"privkey.pem --directory "+remote.Quote(n.Runtime))
 	if err != nil {
 		_, _ = srv.covee.Output(ctx, "rm -f "+next+"fullchain.pem "+next+"privkey.pem", nil)
 		return fmt.Errorf("the network kept %s (run this again once the problem is fixed): %w", old.Hostname, err)

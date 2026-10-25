@@ -83,7 +83,7 @@ func ConsoleInNetwork(ctx context.Context, env *Env, name string) error {
 	if err := env.Records.Save(s.n); err != nil {
 		return err
 	}
-	out, err := srv.covee.Output(ctx, "cd "+serverSource+" && python3 scripts/deploy.py enable-console-network --cert "+serverSecrets+"/tls/fullchain.pem --key "+serverSecrets+"/tls/privkey.pem --directory "+remote.Quote(s.n.Runtime), nil)
+	out, err := srv.deployResult(ctx, "enable-console-network --cert "+serverSecrets+"/tls/fullchain.pem --key "+serverSecrets+"/tls/privkey.pem --directory "+remote.Quote(s.n.Runtime))
 	if err != nil {
 		return err
 	}

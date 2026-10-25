@@ -11,3 +11,7 @@ __pycache__/
 *.pyc
 .DS_Store
 cli/internal/payload/assets/payload.tar.gz
+
+# Swift package build and index folders (local packages such as native/apple/Vendor/*)
+.build/
+.swiftpm/

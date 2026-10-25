@@ -181,7 +181,7 @@ func (s *session) setGateway(ctx context.Context, srv *server, on bool) error {
 	if on {
 		command = "enable-gateway"
 	}
-	out, err := srv.covee.Output(ctx, "cd "+serverSource+" && python3 scripts/deploy.py "+command+" --directory "+remote.Quote(s.n.Runtime), nil)
+	out, err := srv.deployResult(ctx, command+" --directory "+remote.Quote(s.n.Runtime))
 	if err != nil {
 		return err
 	}

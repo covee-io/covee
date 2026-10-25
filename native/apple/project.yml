@@ -19,6 +19,21 @@ settings:
     ENABLE_USER_SCRIPT_SANDBOXING: YES
     CLANG_ENABLE_MODULES: YES
     SWIFT_STRICT_CONCURRENCY: targeted
+# Terminal (SwiftTerm), SSH (Apple's swift-nio-ssh) and, on iPhone and iPad,
+# screen sharing (RoyalVNCKit, archived upstream: a copy in Vendor/RoyalVNC).
+# Only the apps use them, never the network extensions.
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    exactVersion: 1.19.0
+  swift-nio-ssh:
+    url: https://github.com/apple/swift-nio-ssh
+    exactVersion: 0.15.0
+  swift-nio:
+    url: https://github.com/apple/swift-nio
+    minorVersion: 2.104.0
+  RoyalVNC:
+    path: Vendor/RoyalVNC
 targets:
   Covee-macOS:
     type: application
@@ -28,6 +43,11 @@ targets:
         includes: ['*.swift']
       - path: Shared
         includes: ['*.swift']
+      - path: Remote
+        includes: ['*.swift']
+        excludes: ['ScreenShare/**']
+      - path: App/Acknowledgements.txt
+        buildPhase: resources
       - path: App/Assets.xcassets
     settings:
       base:
@@ -45,6 +65,13 @@ targets:
         link: false
       - sdk: NetworkExtension.framework
       - sdk: SystemExtensions.framework
+      - package: SwiftTerm
+      - package: swift-nio-ssh
+        product: NIOSSH
+      - package: swift-nio
+        product: NIOCore
+      - package: swift-nio
+        product: NIOPosix
   Covee-macOS-Tunnel:
     type: system-extension
     platform: macOS
@@ -76,6 +103,10 @@ targets:
         includes: ['*.swift']
       - path: Shared
         includes: ['*.swift']
+      - path: Remote
+        includes: ['**/*.swift']
+      - path: App/Acknowledgements.txt
+        buildPhase: resources
       - path: App/Assets.xcassets
       # Required by the App Store: the reasons for the system calls Covee makes.
       - path: App/PrivacyInfo.xcprivacy
@@ -95,6 +126,15 @@ targets:
         embed: true
         link: false
       - sdk: NetworkExtension.framework
+      - package: SwiftTerm
+      - package: swift-nio-ssh
+        product: NIOSSH
+      - package: swift-nio
+        product: NIOCore
+      - package: swift-nio
+        product: NIOPosix
+      - package: RoyalVNC
+        product: RoyalVNCKit
   Covee-iOS-Tunnel:
     type: app-extension
     platform: iOS
@@ -150,6 +190,7 @@ targets:
     sources:
       - PacketTunnelTests
       - PacketTunnel/AppMessage.swift
+      - PacketTunnel/ConnectionHistory.swift
       - PacketTunnel/NetworkSettings.swift
       - PacketTunnel/NetworkSettingsApplier.swift
     settings:
@@ -158,6 +199,28 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
     dependencies:
       - sdk: NetworkExtension.framework
+  CoveeRemoteTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - RemoteTests
+      - Remote/SSHShell.swift
+      - Remote/SSHIdentity.swift
+      - Remote/RemoteAccessStore.swift
+      - Remote/RemoteTarget.swift
+      - Shared/ProviderStatus.swift
+      - Shared/ClientConfiguration.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.covee.remote.tests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - package: swift-nio-ssh
+        product: NIOSSH
+      - package: swift-nio
+        product: NIOCore
+      - package: swift-nio
+        product: NIOPosix
 schemes:
   Covee-macOS:
     build:
@@ -189,3 +252,9 @@ schemes:
         Covee-iOS-Tests: all
     test:
       targets: [Covee-iOS-Tests]
+  CoveeRemoteTests:
+    build:
+      targets:
+        CoveeRemoteTests: all
+    test:
+      targets: [CoveeRemoteTests]

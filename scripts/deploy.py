@@ -609,6 +609,30 @@ def with_tag_owner(policy_text, tag):
     return json.dumps(policy, indent=2) + "\n"
 
 
+# Tailscale's iPhone and Android clients send DNS for domains behind a subnet
+# router, such as a gateway's private zones, through the network only with this
+# attribute; without it they ask those servers outside the network, where they
+# cannot be reached, and on iPhone the waiting lookups can push the network
+# extension past its memory limit, which ends the connection.
+DIAL_ROUTES = "user-dial-routes"
+
+
+def with_node_attribute(policy_text, attribute):
+    """The policy with attribute given to every device, or None if it is."""
+    try:
+        policy = json.loads(strip_hujson(policy_text))
+    except ValueError as error:
+        raise DeploymentError("The persisted policy could not be read") from error
+    attributes = policy.setdefault("nodeAttrs", []) if isinstance(policy, dict) else None
+    if not isinstance(attributes, list):
+        raise DeploymentError("The persisted policy has unexpected nodeAttrs")
+    for entry in attributes:
+        if isinstance(entry, dict) and "*" in (entry.get("target") or []) and attribute in (entry.get("attr") or []):
+            return None
+    attributes.append({"target": ["*"], "attr": [attribute]})
+    return json.dumps(policy, indent=2) + "\n"
+
+
 def move_accounts(database, old_issuer, new_issuer):
     """File the coordinator's sign-in accounts under a new issuer; returns how many moved.
 
@@ -1352,7 +1376,9 @@ class Runtime:
             path = self.directory / name
             if path.is_symlink() or not path.is_dir() or path.stat().st_mode & 0o077 or path.stat().st_uid != os.getuid():
                 raise DeploymentError("The gateway's folders must be private directories owned by the service account")
-        merged = with_tag_owner(self.control("policy", "get").stdout.decode(), GATEWAY_TAG)
+        current = self.control("policy", "get").stdout.decode()
+        merged = with_tag_owner(current, GATEWAY_TAG)
+        merged = with_node_attribute(merged or current, DIAL_ROUTES) or merged
         if merged:
             self.control("policy", "check", "--file", "/dev/stdin", data=merged.encode())
             self.control("policy", "set", "--file", "/dev/stdin", data=merged.encode())

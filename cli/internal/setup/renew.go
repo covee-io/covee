@@ -42,7 +42,7 @@ func CertRenew(ctx context.Context, env *Env, name string) error {
 	if err := srv.putFile(ctx, serverSecrets+"/tls/privkey.pem", key, "400"); err != nil {
 		return err
 	}
-	out, err := srv.covee.Output(ctx, "cd "+serverSource+" && python3 scripts/deploy.py renew-certificates --cert "+serverSecrets+"/tls/fullchain.pem --key "+serverSecrets+"/tls/privkey.pem --directory "+remote.Quote(s.n.Runtime), nil)
+	out, err := srv.deployResult(ctx, "renew-certificates --cert "+serverSecrets+"/tls/fullchain.pem --key "+serverSecrets+"/tls/privkey.pem --directory "+remote.Quote(s.n.Runtime))
 	if err != nil {
 		return err
 	}

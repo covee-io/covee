@@ -444,6 +444,9 @@ func TestInviteLifecycleAndPasswordSignIn(t *testing.T) {
 	if claims["upstream_issuer"] != f.origin+"/identity#local" || claims["upstream_sub"] != account.ID || fmt.Sprint(claims["roles"]) != "[Covee.Admin]" {
 		t.Fatalf("claims = %v", claims)
 	}
+	if claims["email"] != "alice@example.com" || claims["email_verified"] != true || claims["name"] != "Alice" {
+		t.Fatalf("the account's profile is missing: %v", claims)
+	}
 	if account.LastSignIn.IsZero() || account.TOTPLastStep != step+1 {
 		t.Fatalf("sign-in not recorded: %+v", account)
 	}

@@ -277,13 +277,19 @@ func TestRealSignedProvidersAndDownstreamJWT(t *testing.T) {
 		t.Run(provider, func(t *testing.T) {
 			f := newFixture(t)
 			subject := "social-person"
-			extra := map[string]any{"roles": []string{RoleAdmin}}
+			extra := map[string]any{"roles": []string{RoleAdmin}, "email": "Pat@Example.com", "email_verified": true, "name": "Pat Example"}
+			email, name := "pat@example.com", "Pat Example"
 			if provider == "apple" {
+				// Apple sends no name in its token, and older tokens send the flag as a string.
 				subject = "apple-person"
+				extra = map[string]any{"roles": []string{RoleAdmin}, "email": "x1@privaterelay.appleid.com", "email_verified": "true"}
+				email, name = "x1@privaterelay.appleid.com", "x1@privaterelay.appleid.com"
 			}
 			if provider == "entra" {
+				// Entra's profile scope carries the sign-in name, not an email claim.
 				subject = "entra-person"
-				extra["groups"] = []string{"11234567-89ab-cdef-0123-456789abcdef"}
+				extra = map[string]any{"roles": []string{RoleAdmin}, "groups": []string{"11234567-89ab-cdef-0123-456789abcdef"}, "preferred_username": "Pat@Contoso.com", "name": "Pat Example"}
+				email = "pat@contoso.com"
 			}
 			for _, client := range []string{"console", "enrollment"} {
 				flow := f.start(client, provider)
@@ -326,6 +332,9 @@ func TestRealSignedProvidersAndDownstreamJWT(t *testing.T) {
 				if claims.UpstreamIssuer != f.server.providers[provider].issuer || claims.UpstreamSubject != subject || claims.Username != "u"+id.Subject {
 					t.Fatal("lost upstream binding")
 				}
+				if claims.Email != email || !claims.EmailVerified || claims.Name != name {
+					t.Fatalf("profile = %q %v %q", claims.Email, claims.EmailVerified, claims.Name)
+				}
 				if client == "console" {
 					if len(claims.Groups) != 0 || len(claims.Roles) != 1 {
 						t.Fatal("console claims crossed audience")
@@ -343,7 +352,7 @@ func TestRealSignedProvidersAndDownstreamJWT(t *testing.T) {
 					t.Fatal(err)
 				}
 				userinfo := readBody(t, response)
-				if response.StatusCode != 200 || !strings.Contains(userinfo, id.Subject) || strings.Contains(userinfo, "email") {
+				if response.StatusCode != 200 || !strings.Contains(userinfo, id.Subject) || !strings.Contains(userinfo, `"email":"`+email+`","email_verified":true`) {
 					t.Fatalf("userinfo %d %s", response.StatusCode, userinfo)
 				}
 				response = f.exchange(client, value, flow.verifier)
@@ -376,6 +385,67 @@ func TestRealSignedProvidersAndDownstreamJWT(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTheProfileOnlyLabelsThePerson(t *testing.T) {
+	f := newFixture(t)
+	group := []string{"11234567-89ab-cdef-0123-456789abcdef"}
+	signIn := func(provider, subject string, extra map[string]any) (string, identityClaims) {
+		t.Helper()
+		flow := f.start("enrollment", provider)
+		r := f.exchange("enrollment", issuedCode(t, f.callback(flow, provider, subject, extra)), flow.verifier)
+		body := readBody(t, r)
+		var result struct {
+			ID string `json:"id_token"`
+		}
+		if r.StatusCode != 200 || json.Unmarshal([]byte(body), &result) != nil {
+			t.Fatalf("exchange %d %s", r.StatusCode, body)
+		}
+		ctx := oidc.ClientContext(context.Background(), f.client)
+		discovery, err := oidc.NewProvider(ctx, f.server.config.Issuer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := discovery.VerifierContext(ctx, &oidc.Config{ClientID: "enrollment", SupportedSigningAlgs: []string{"RS256"}}).Verify(ctx, result.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var claims identityClaims
+		var raw map[string]any
+		if id.Claims(&claims) != nil || id.Claims(&raw) != nil {
+			t.Fatal("invalid claims")
+		}
+		if _, ok := raw["email_verified"]; ok != (claims.Email != "") {
+			t.Fatalf("email_verified must come with an address and only then: %v", raw)
+		}
+		return id.Subject, claims
+	}
+	for _, c := range []struct {
+		name, provider, subject string
+		extra                   map[string]any
+		email, display          string
+	}{
+		{"an unverified Google address is left out", "google", "social-person", map[string]any{"email": "pat@example.com", "email_verified": false, "name": "Pat Example"}, "", "Pat Example"},
+		{"a Google address without the flag is left out", "google", "social-person", map[string]any{"email": "pat@example.com"}, "", "Covee user"},
+		{"Apple's flag must say true", "apple", "apple-person", map[string]any{"email": "x1@privaterelay.appleid.com", "email_verified": "false"}, "", "Covee user"},
+		{"an Entra guest's email comes before its sign-in name", "entra", "guest", map[string]any{"groups": group, "email": "Guest@Fabrikam.com", "preferred_username": "guest_fabrikam.com#EXT#@contoso.onmicrosoft.com"}, "guest@fabrikam.com", "guest@fabrikam.com"},
+		{"a display-form address is not an address", "entra", "member", map[string]any{"groups": group, "email": "Pat <pat@contoso.com>", "preferred_username": "pat@contoso.com"}, "pat@contoso.com", "pat@contoso.com"},
+		{"a phone sign-in name is not an address", "entra", "phone", map[string]any{"groups": group, "preferred_username": "+15551234567"}, "", "Covee user"},
+		{"a name with control characters is left out", "entra", "member", map[string]any{"groups": group, "preferred_username": "pat@contoso.com", "name": "Pat\u0007Example"}, "pat@contoso.com", "pat@contoso.com"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, claims := signIn(c.provider, c.subject, c.extra)
+			if claims.Email != c.email || claims.EmailVerified != (c.email != "") || claims.Name != c.display {
+				t.Fatalf("profile = %q %v %q", claims.Email, claims.EmailVerified, claims.Name)
+			}
+		})
+	}
+	// One address on two accounts stays two people: the address never links them.
+	first, a := signIn("entra", "one", map[string]any{"groups": group, "preferred_username": "pat@contoso.com"})
+	second, b := signIn("entra", "two", map[string]any{"groups": group, "preferred_username": "pat@contoso.com"})
+	if first == second || a.Username == b.Username || a.Email != b.Email {
+		t.Fatalf("an address linked two accounts: %s %s", first, second)
 	}
 }
 

@@ -174,8 +174,18 @@ func (s *server) putFile(ctx context.Context, path string, data []byte, mode str
 	return nil
 }
 
+// deploy runs scripts/deploy.py on the server and shows its output. It runs
+// apart from the SSH session, so a restart that cuts the session (when the
+// admin comes in through the network's gateway) does not stop it halfway.
 func (s *server) deploy(ctx context.Context, args string) error {
-	return s.covee.Stream(ctx, "cd "+serverSource+" && python3 scripts/deploy.py "+args, nil, s.out)
+	_, err := s.covee.Apart(ctx, "cd "+serverSource+" && python3 scripts/deploy.py "+args, s.out)
+	return err
+}
+
+// deployResult runs scripts/deploy.py like deploy, and returns its output
+// instead of showing it.
+func (s *server) deployResult(ctx context.Context, args string) ([]byte, error) {
+	return s.covee.Apart(ctx, "cd "+serverSource+" && python3 scripts/deploy.py "+args, nil)
 }
 
 // nextRuntime returns the first unused /srv/covee/runtime-N directory, so a

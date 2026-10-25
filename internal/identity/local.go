@@ -2,6 +2,7 @@ package identity
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
@@ -13,6 +14,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"strings"
 	"sync"
@@ -122,16 +124,40 @@ var credentialParams = []protocol.CredentialParameter{
 	{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgRS256},
 }
 
+// profile is how a sign-in labels the person: an email address and a name.
+// It is never part of the identity, which comes only from the issuer and
+// subject, so two accounts with one address stay two people.
+type profile struct{ email, name string }
+
+func displayProfile(email, name string) profile {
+	name = strings.TrimSpace(name)
+	if !textOK(name, 1, 200) {
+		name = ""
+	}
+	return profile{email: plainAddress(email), name: name}
+}
+
+// plainAddress returns v in lower case when it is a bare email address, and
+// "" for anything else, such as a phone number or `Name <address>`.
+func plainAddress(v string) string {
+	parsed, err := mail.ParseAddress(v)
+	if err != nil || parsed.Name != "" || parsed.Address != v || !textOK(v, 3, 254) {
+		return ""
+	}
+	return strings.ToLower(v)
+}
+
 // issue is the shared end of every sign-in: it applies the flow's role or
 // enrollment requirement, then issues a one-minute code for the downstream
-// client. namespace and upstreamSubject together form the stable identity.
-func (s *Server) issue(pending flow, namespace, upstreamSubject, role string, enroll bool) (string, error) {
+// client. namespace and upstreamSubject together form the stable identity;
+// who only labels it.
+func (s *Server) issue(pending flow, namespace, upstreamSubject, role string, enroll bool, who profile) (string, error) {
 	if (pending.kind == "console" && role == "") || (pending.kind == "enrollment" && !enroll) {
 		return "", errDenied
 	}
 	hash := sha256.Sum256([]byte(namespace + "\x00" + upstreamSubject))
 	subject := hex.EncodeToString(hash[:])
-	claims := identityClaims{Subject: subject, Username: "u" + subject, Name: "Covee user", UpstreamIssuer: namespace, UpstreamSubject: upstreamSubject}
+	claims := identityClaims{Subject: subject, Username: "u" + subject, Name: cmp.Or(who.name, who.email, "Covee user"), Email: who.email, EmailVerified: who.email != "", UpstreamIssuer: namespace, UpstreamSubject: upstreamSubject}
 	if pending.kind == "console" {
 		claims.Roles = []string{role}
 	} else {
@@ -355,7 +381,7 @@ func (s *Server) passwordSignIn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cookie(w, "", time.Unix(1, 0), http.SameSiteLaxMode, -1)
-	target, err := s.issue(pending, s.localNamespace(), account.ID, account.Role, account.Enroll)
+	target, err := s.issue(pending, s.localNamespace(), account.ID, account.Role, account.Enroll, displayProfile(account.Email, account.Name))
 	s.finishHTML(w, r, target, err, "Covee account", account.Email)
 }
 
@@ -457,7 +483,7 @@ func (s *Server) passkeyFinish(w http.ResponseWriter, r *http.Request) {
 		deny(w, 400, "authentication_failed")
 		return
 	}
-	target, err := s.issue(pending, s.localNamespace(), account.ID, account.Role, account.Enroll)
+	target, err := s.issue(pending, s.localNamespace(), account.ID, account.Role, account.Enroll, displayProfile(account.Email, account.Name))
 	switch {
 	case errors.Is(err, errDenied):
 		reply(w, 403, map[string]string{"error": "access_denied", "provider": "Covee account", "subject": account.Email})

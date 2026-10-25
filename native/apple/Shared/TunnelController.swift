@@ -17,6 +17,8 @@ final class TunnelController: ObservableObject {
     @Published private(set) var operationMessage: String?
     @Published private(set) var changingExitNode = false
     @Published var configuration: ClientConfiguration
+    /// The networks this device has connected to, for switching without typing.
+    @Published private(set) var savedNetworks: SavedNetworks
 
     #if os(macOS)
     static let providerIdentifier = "io.covee.macos.tunnel"
@@ -25,12 +27,20 @@ final class TunnelController: ObservableObject {
     #else
     static let providerIdentifier = "io.covee.ios.tunnel"
     #endif
+    /// Marks a start from this app; the extension records other starts as the
+    /// system reconnecting by itself (PacketTunnelProvider's startedByAppOption).
+    static let startedByAppOption = "coveeStartedByApp"
     private let store: ConfigurationStore
     private var manager: NETunnelProviderManager?
     private var observer: NSObjectProtocol?
     private var polling: Task<Void, Never>?
     private var refreshInProgress = false
     private var connectionGeneration: UInt64 = 0
+    private var disconnectRequested = false
+    private var failedStatusReplies = 0
+    /// The warning the status checks last put in errorMessage, which they take
+    /// away again once it no longer applies.
+    private var statusWarning: String?
 
     var connected: Bool { providerStatus.isConnected(systemConnected: status == .connected) }
     var active: Bool { [.connecting, .connected, .reasserting, .disconnecting].contains(status) }
@@ -55,9 +65,13 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    /// The coordinator of the running connection, as the VPN profile records it.
+    var currentControlURL: String? { profileConfiguration?.controlURL }
+
     init(store: ConfigurationStore = ConfigurationStore()) {
         self.store = store
         configuration = store.load()
+        savedNetworks = store.loadNetworks()
         observer = NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in await self?.refreshStatus() }
         }
@@ -113,6 +127,7 @@ final class TunnelController: ObservableObject {
             }
             connectionGeneration &+= 1
             providerStatus = .empty
+            disconnectRequested = false
             let tunnelProtocol = NETunnelProviderProtocol()
             tunnelProtocol.providerBundleIdentifier = Self.providerIdentifier
             tunnelProtocol.serverAddress = checked.controlURL
@@ -120,13 +135,18 @@ final class TunnelController: ObservableObject {
             chosen.protocolConfiguration = tunnelProtocol
             chosen.localizedDescription = "Covee"
             chosen.isEnabled = true
+            // Reconnecting by itself is turned on once this start, the only one
+            // that carries an enrollment key, is under way.
+            chosen.isOnDemandEnabled = false
             try await Self.save(chosen)
             try await Self.reload(chosen)
             replaceManager(chosen)
             // Enrollment credentials are transient start options only. Do not add them to settings or protocolConfiguration.
-            let options: [String: NSObject]? = key.isEmpty ? nil : ["authKey": key as NSString]
+            var options: [String: NSObject] = [Self.startedByAppOption: NSNumber(value: true)]
+            if !key.isEmpty { options["authKey"] = key as NSString }
             try chosen.connection.startVPNTunnel(options: options)
             operationMessage = nil
+            await stayConnected(chosen)
             await refreshStatus()
         } catch {
             operationMessage = nil
@@ -134,13 +154,84 @@ final class TunnelController: ObservableObject {
         }
     }
 
-    func disconnect() {
-        guard !isBusy else { return }
+    /// Keeps a started tunnel running: the system starts it again whenever it
+    /// stops for any reason but Disconnect, for example when the extension
+    /// ends or the network changes.
+    private func stayConnected(_ chosen: NETunnelProviderManager) async {
+        let always = NEOnDemandRuleConnect()
+        always.interfaceTypeMatch = .any
+        chosen.onDemandRules = [always]
+        chosen.isOnDemandEnabled = true
+        do {
+            try await Self.save(chosen)
+            try await Self.reload(chosen)
+        } catch {
+            errorMessage = "Connected, but Covee could not turn on reconnecting by itself: \(error.localizedDescription)"
+        }
+    }
+
+    func disconnect() async {
+        guard !isBusy, let manager else { return }
+        isBusy = true
+        defer { isBusy = false }
+        disconnectRequested = true
+        // Otherwise the system would start the tunnel again at once.
+        do {
+            try await Self.reload(manager)
+            if manager.isOnDemandEnabled {
+                manager.isOnDemandEnabled = false
+                try await Self.save(manager)
+            }
+        } catch {
+            errorMessage = "Covee may connect again by itself: \(error.localizedDescription)"
+        }
         connectionGeneration &+= 1
-        manager?.connection.stopVPNTunnel()
+        manager.connection.stopVPNTunnel()
         providerStatus = .empty
-        status = manager?.connection.status ?? .invalid
+        status = manager.connection.status
         operationMessage = nil
+        setStatusWarning(nil)
+    }
+
+    /// Connects to a saved network, leaving the current one first.
+    func connect(to network: SavedNetworks.Network) async {
+        guard !isBusy else { return }
+        if active {
+            await disconnect()
+            // The system refuses a new start until the old connection has stopped.
+            for _ in 0..<80 where active {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                await refreshStatus()
+            }
+            guard !active else {
+                errorMessage = "Covee could not leave the current network. Try again."
+                return
+            }
+        }
+        configuration.controlURL = network.controlURL
+        configuration.hostname = network.hostname
+        await connect(authKey: "")
+    }
+
+    /// Removes a network from the list; connecting to its address adds it again.
+    func forget(_ network: SavedNetworks.Network) {
+        savedNetworks.forget(network)
+        store.saveNetworks(savedNetworks)
+    }
+
+    /// Records the running network first in the list, with those the extension
+    /// has a saved sign-in for, once its status shows them.
+    private func noteNetworks() {
+        var updated = savedNetworks
+        if status == .connected, providerStatus.engineRunning, let current = profileConfiguration {
+            updated.remember(current, suffix: providerStatus.magicDNSSuffix)
+        }
+        if let known = providerStatus.networks {
+            updated.add(known, hostname: (profileConfiguration ?? configuration).hostname)
+        }
+        guard updated != savedNetworks else { return }
+        savedNetworks = updated
+        store.saveNetworks(updated)
     }
 
     /// Sends this device's internet traffic through a peer's exit node, or
@@ -216,7 +307,15 @@ final class TunnelController: ObservableObject {
         if currentStatus != status {
             connectionGeneration &+= 1
             providerStatus = .empty
+            failedStatusReplies = 0
+            let previous = status
             status = currentStatus
+            if currentStatus == .connected { disconnectRequested = false }
+            if currentStatus == .disconnected, [.connecting, .connected, .reasserting].contains(previous), !disconnectRequested {
+                explainDisconnect()
+            } else {
+                setStatusWarning(nil)
+            }
         }
         guard !refreshInProgress else { return }
         guard [.connecting, .connected, .reasserting].contains(status),
@@ -235,7 +334,7 @@ final class TunnelController: ObservableObject {
             let message = Data("{\"command\":\"status\"}".utf8)
             let response: Data? = try await withCheckedThrowingContinuation { continuation in
                 let reply = ProviderReply(continuation)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                     reply.finish(.failure(ProviderStatusError.noResponse))
                 }
                 do {
@@ -249,15 +348,47 @@ final class TunnelController: ObservableObject {
                 return
             }
             providerStatus = try JSONDecoder().decode(ProviderStatus.self, from: response)
-            if let providerError = providerStatus.error, !providerError.isEmpty { errorMessage = providerError }
+            failedStatusReplies = 0
+            noteNetworks()
             if providerStatus.authURL != nil, authenticationURL == nil {
-                errorMessage = "The coordinator returned a sign-in address outside its HTTPS origin. Check the coordinator’s public URL configuration."
+                setStatusWarning("The coordinator returned a sign-in address outside its HTTPS origin. Check the coordinator’s public URL configuration.")
+            } else {
+                setStatusWarning(providerStatus.error.flatMap { $0.isEmpty ? nil : $0 })
             }
         } catch {
             guard requestIsCurrent() else { return }
-            // The provider may be starting; retain no stale claim that the engine is running.
+            // One slow answer is normal, as when the app returns to the
+            // foreground. Keep the last status until several in a row are
+            // missing; then retain no stale claim that the engine is running.
+            failedStatusReplies += 1
+            guard failedStatusReplies >= 3 else { return }
             providerStatus = .empty
-            if status == .connected { errorMessage = "The VPN is active, but its network status is unavailable. Disconnect and try again." }
+            if status == .connected { setStatusWarning("The VPN is on, but Covee’s network extension is not answering.") }
+        }
+    }
+
+    /// Shows a status problem in errorMessage, or takes the last one away
+    /// without touching other messages.
+    private func setStatusWarning(_ message: String?) {
+        if let message {
+            errorMessage = message
+        } else if let shown = statusWarning, errorMessage == shown {
+            errorMessage = nil
+        }
+        statusWarning = message
+    }
+
+    /// Says why the system ended a connection that the person did not end.
+    /// Usually the system starts it again at once, which clears this.
+    private func explainDisconnect() {
+        guard let connection = manager?.connection else { return }
+        let generation = connectionGeneration
+        connection.fetchLastDisconnectError { [weak self] error in
+            guard let reason = error?.localizedDescription else { return }
+            Task { @MainActor in
+                guard let self, self.connectionGeneration == generation, self.status == .disconnected else { return }
+                self.setStatusWarning("The connection ended: \(reason)")
+            }
         }
     }
 
@@ -271,6 +402,11 @@ final class TunnelController: ObservableObject {
             if let saved = profileConfiguration,
                [.connecting, .connected, .reasserting, .disconnecting].contains(existing?.connection.status ?? .invalid) {
                 configuration = saved
+            }
+            // A connection started by an earlier Covee, which did not reconnect by itself.
+            if let existing, existing.isEnabled, !existing.isOnDemandEnabled,
+               [.connecting, .connected, .reasserting].contains(existing.connection.status) {
+                await stayConnected(existing)
             }
             await refreshStatus()
         } catch {

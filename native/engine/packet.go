@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net/netip"
 	"os"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/tailscale/wireguard-go/tun"
 )
@@ -14,6 +16,99 @@ import (
 const maxPacketBytes = 65535
 
 var errQueueFull = errors.New("packet queue is full")
+
+// The network's name service (100.100.100.100, fd7a:115c:a1e0::53) answers for
+// the network's own names and forwards other domains, such as a gateway's
+// private DNS zones. When such a server cannot be reached, every lookup waits
+// for its timeout and holds memory meanwhile; a phone's apps send hundreds a
+// second, enough to pass the iPhone's 50 MB limit for a network extension,
+// which ends the connection. At most maxWaitingLookups wait at once: more are
+// dropped, as a busy DNS server's would be, and the apps ask again.
+const (
+	maxWaitingLookups = 32
+	lookupWait        = 8 * time.Second
+)
+
+var (
+	nameServiceV4 = [4]byte{100, 100, 100, 100}
+	nameServiceV6 = netip.MustParseAddr("fd7a:115c:a1e0::53").As16()
+)
+
+// lookupGuard counts the lookups to the name service still waiting for an answer.
+type lookupGuard struct {
+	mu      sync.Mutex
+	waiting map[uint32]time.Time // the asker's UDP port << 16 | DNS message ID
+}
+
+// admit reports whether a lookup may go to the name service now.
+func (g *lookupGuard) admit(key uint32, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.waiting == nil {
+		g.waiting = make(map[uint32]time.Time)
+	}
+	if _, asked := g.waiting[key]; !asked && len(g.waiting) >= maxWaitingLookups {
+		for k, at := range g.waiting {
+			if now.Sub(at) > lookupWait {
+				delete(g.waiting, k)
+			}
+		}
+		if len(g.waiting) >= maxWaitingLookups {
+			return false
+		}
+	}
+	g.waiting[key] = now
+	return true
+}
+
+func (g *lookupGuard) answered(key uint32) {
+	g.mu.Lock()
+	delete(g.waiting, key)
+	g.mu.Unlock()
+}
+
+// lookupKey identifies a UDP DNS lookup to the name service (query) or its
+// answer (!query), by the asker's port and the message ID.
+func lookupKey(p []byte, query bool) (uint32, bool) {
+	var udp []byte
+	switch p[0] >> 4 {
+	case 4:
+		header := int(p[0]&15) * 4
+		if len(p) < header+10 || p[9] != 17 || binary.BigEndian.Uint16(p[6:8])&0x3fff != 0 {
+			return 0, false
+		}
+		address := p[16:20]
+		if !query {
+			address = p[12:16]
+		}
+		if [4]byte(address) != nameServiceV4 {
+			return 0, false
+		}
+		udp = p[header:]
+	case 6:
+		if len(p) < 50 || p[6] != 17 {
+			return 0, false
+		}
+		address := p[24:40]
+		if !query {
+			address = p[8:24]
+		}
+		if [16]byte(address) != nameServiceV6 {
+			return 0, false
+		}
+		udp = p[40:]
+	default:
+		return 0, false
+	}
+	service, asker := udp[2:4], udp[0:2]
+	if !query {
+		service, asker = udp[0:2], udp[2:4]
+	}
+	if binary.BigEndian.Uint16(service) != 53 {
+		return 0, false
+	}
+	return uint32(binary.BigEndian.Uint16(asker))<<16 | uint32(binary.BigEndian.Uint16(udp[8:10])), true
+}
 
 // packetDevice is the Apple packetFlow boundary. No host TUN is opened.
 // outgoing is from Apple -> engine; incoming is engine -> Apple.
@@ -29,6 +124,7 @@ type packetDevice struct {
 	readHold []byte
 	mtu      int
 	name     string
+	lookups  lookupGuard
 }
 
 func newPacketDevice() *packetDevice {
@@ -80,6 +176,9 @@ func validIPPacket(p []byte) bool {
 func (t *packetDevice) inject(p []byte) error {
 	if !validIPPacket(p) {
 		return errors.New("invalid IPv4 or IPv6 packet")
+	}
+	if key, ok := lookupKey(p, true); ok && !t.lookups.admit(key, time.Now()) {
+		return nil
 	}
 	t.flowMu.RLock()
 	defer t.flowMu.RUnlock()
@@ -154,6 +253,9 @@ func (t *packetDevice) Write(bufs [][]byte, offset int) (int, error) {
 		}
 		if !validIPPacket(packet) {
 			return i, errors.New("invalid IP packet from engine")
+		}
+		if key, ok := lookupKey(packet, false); ok {
+			t.lookups.answered(key)
 		}
 		select {
 		case <-t.done:

@@ -116,6 +116,11 @@ type peerStatus struct {
 	ExitNode bool `json:"exitNode"`
 	// Routes are the local networks the peer currently serves as subnet router.
 	Routes []string `json:"routes"`
+	// OS is the peer's operating system as it reports it, such as macOS or linux.
+	OS string `json:"os,omitempty"`
+	// SSHHostKeys are the SSH host keys a peer running Tailscale SSH publishes
+	// through the coordinator, which lets people in by their network identity.
+	SSHHostKeys []string `json:"sshHostKeys,omitempty"`
 }
 
 type engineStatus struct {
@@ -137,38 +142,48 @@ type engineStatus struct {
 	// AcceptRoutes: this device uses the routes other devices offer, such as
 	// a network gateway's.
 	AcceptRoutes bool `json:"acceptRoutes"`
+	// Networks are the coordinators this device has a saved sign-in for, so
+	// the app can offer them again without typing their address.
+	Networks []knownNetwork `json:"networks"`
+}
+
+type knownNetwork struct {
+	ControlURL string `json:"controlURL"`
+	// Suffix is the network's device name suffix, such as mesh.example.com.
+	Suffix string `json:"suffix,omitempty"`
 }
 
 // canOfferExitNode: a Mac can be an exit node; Apple does not allow it on iPhone.
 var canOfferExitNode = runtime.GOOS != "ios"
 
 type engine struct {
-	cfg        engineConfig
-	store      *keychainStore
-	tun        *packetDevice
-	done       chan struct{}
-	stopOnce   sync.Once
-	lifeMu     sync.Mutex
-	started    bool
-	backend    *ipnlocal.LocalBackend
-	netstack   *netstack.Impl
-	netmon     *netmon.Monitor
-	dialer     *tsdial.Dialer
-	ctx        context.Context
-	cancel     context.CancelFunc
-	workers    sync.WaitGroup
-	settings   chan []byte
-	statuses   chan []byte
-	errors     chan []byte
-	eventMu    sync.Mutex
-	eventHold  []byte
-	packetMu   sync.Mutex
-	packetHold []byte
-	errMu      sync.Mutex
-	lastError  string
-	ackMu      sync.Mutex
-	acks       map[uint64]chan error
-	nextGen    atomic.Uint64
+	cfg         engineConfig
+	store       *keychainStore
+	tun         *packetDevice
+	done        chan struct{}
+	stopOnce    sync.Once
+	lifeMu      sync.Mutex
+	started     bool
+	backend     *ipnlocal.LocalBackend
+	netstack    *netstack.Impl
+	netmon      *netmon.Monitor
+	dialer      *tsdial.Dialer
+	ctx         context.Context
+	cancel      context.CancelFunc
+	workers     sync.WaitGroup
+	settings    chan []byte
+	statuses    chan []byte
+	errors      chan []byte
+	eventMu     sync.Mutex
+	eventHold   []byte
+	packetMu    sync.Mutex
+	packetHold  []byte
+	errMu       sync.Mutex
+	lastError   string
+	lastErrorAt time.Time
+	ackMu       sync.Mutex
+	acks        map[uint64]chan error
+	nextGen     atomic.Uint64
 	// Final native deliveries/status publication cannot cross a fatal latch.
 	// Never hold this lock while calling the backend or waiting for a packet.
 	deliveryMu     sync.RWMutex
@@ -191,6 +206,18 @@ var engineLogf logger.Logf = logger.Discard
 const persistenceFailure = "Durable client identity could not be saved; tunnel stopped."
 
 var persistenceEvent = []byte(`{"type":"error","code":"persistence","error":"` + persistenceFailure + `"}`)
+
+const (
+	// The backend's last notice to a watch it closes for falling behind
+	// (watchIPNBusFellBehindMessage in ipnlocal). The engine watches again.
+	watchFellBehind = "IPN bus consumer fell behind; closing watch"
+	// A passing problem stops showing once the connection has run this long
+	// after it.
+	staleErrorAge = 2 * time.Minute
+	// How long to wait before asking for a sign-in address again after the
+	// coordinator could not give one.
+	signInRetry = 30 * time.Second
+)
 
 func newEngine(cfg engineConfig, store *keychainStore) *engine {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -306,19 +333,29 @@ func (e *engine) start() error {
 	}
 	e.backend = lb
 	watchReady := make(chan struct{})
+	var watchAdded sync.Once
 	e.workers.Add(2)
 	go func() {
 		defer e.workers.Done()
-		lb.WatchNotifications(e.ctx, ipn.NotifyInitialState|ipn.NotifyNoNetMap, func() { close(watchReady) }, func(n *ipn.Notify) bool {
-			if n.ErrMessage != nil && *n.ErrMessage != "" {
-				e.recordError(errors.New(*n.ErrMessage))
+		for {
+			lb.WatchNotifications(e.ctx, ipn.NotifyInitialState|ipn.NotifyNoNetMap, func() { watchAdded.Do(func() { close(watchReady) }) }, func(n *ipn.Notify) bool {
+				if n.ErrMessage != nil && *n.ErrMessage != "" && *n.ErrMessage != watchFellBehind {
+					e.recordError(errors.New(*n.ErrMessage))
+				}
+				if n.State != nil && *n.State != ipn.NeedsLogin {
+					// Every new need for a login gets its own sign-in request.
+					e.signInAsked.Store(false)
+				}
+				return true
+			})
+			// The backend closes a watch that falls behind; watch again for
+			// the rest of the connection.
+			select {
+			case <-e.done:
+				return
+			case <-time.After(time.Second):
 			}
-			if n.State != nil && *n.State != ipn.NeedsLogin {
-				// Every new need for a login gets its own sign-in request.
-				e.signInAsked.Store(false)
-			}
-			return true
-		})
+		}
 	}()
 	go func() {
 		defer e.workers.Done()
@@ -377,6 +414,8 @@ func (e *engine) signInIfNeeded(lb *ipnlocal.LocalBackend) {
 	}
 	if err := lb.StartLoginInteractive(e.ctx); err != nil && e.ctx.Err() == nil {
 		e.recordError(fmt.Errorf("start interactive login: %w", err))
+		// The coordinator may be out of reach for a moment; ask again later.
+		time.AfterFunc(signInRetry, func() { e.signInAsked.Store(false) })
 	}
 }
 
@@ -509,7 +548,12 @@ func (e *engine) publishStatus(lb *ipnlocal.LocalBackend) {
 // buildStatus is the snapshot publishStatus sends to the app.
 func (e *engine) buildStatus(lb *ipnlocal.LocalBackend) engineStatus {
 	st := lb.Status()
-	status := engineStatus{BackendState: st.BackendState, IPs: []string{}, Peers: []peerStatus{}, AuthURL: st.AuthURL}
+	status := engineStatus{BackendState: st.BackendState, IPs: []string{}, Peers: []peerStatus{}, AuthURL: st.AuthURL, Networks: []knownNetwork{}}
+	for _, p := range lb.ListProfiles() {
+		if p.ControlURL() != "" {
+			status.Networks = append(status.Networks, knownNetwork{ControlURL: p.ControlURL(), Suffix: strings.TrimSuffix(p.NetworkProfile().MagicDNSName, ".")})
+		}
+	}
 	if st.CurrentTailnet != nil {
 		status.MagicDNSSuffix = st.CurrentTailnet.MagicDNSSuffix
 	}
@@ -527,7 +571,8 @@ func (e *engine) buildStatus(lb *ipnlocal.LocalBackend) engineStatus {
 	}
 	for _, p := range st.Peer {
 		peer := peerStatus{ID: string(p.ID), Name: p.DNSName, IPs: []string{}, Online: p.Online,
-			ExitNodeOption: p.ExitNodeOption, ExitNode: p.ExitNode, Routes: []string{}}
+			ExitNodeOption: p.ExitNodeOption, ExitNode: p.ExitNode, Routes: []string{},
+			OS: p.OS, SSHHostKeys: p.SSH_HostKeys}
 		if peer.Name == "" {
 			peer.Name = p.HostName
 		}
@@ -540,10 +585,21 @@ func (e *engine) buildStatus(lb *ipnlocal.LocalBackend) engineStatus {
 		status.Peers = append(status.Peers, peer)
 	}
 	sort.Slice(status.Peers, func(i, j int) bool { return status.Peers[i].ID < status.Peers[j].ID })
-	e.errMu.Lock()
-	status.Error = e.lastError
-	e.errMu.Unlock()
+	status.Error = e.currentError(st.BackendState)
 	return status
+}
+
+// currentError is the problem a status reports. The connection keeps running
+// through passing problems, such as a late settings acknowledgement or the
+// coordinator out of reach for a moment; once it has run normally for a while
+// after one, that problem is no longer news.
+func (e *engine) currentError(backendState string) string {
+	e.errMu.Lock()
+	defer e.errMu.Unlock()
+	if e.lastError != "" && !e.fatal.Load() && backendState == ipn.Running.String() && time.Since(e.lastErrorAt) > staleErrorAge {
+		e.lastError = ""
+	}
+	return e.lastError
 }
 
 type exitNodeRequest struct {
@@ -713,6 +769,7 @@ func (e *engine) recordError(err error) {
 	message := e.sanitize(err.Error())
 	e.errMu.Lock()
 	e.lastError = message
+	e.lastErrorAt = time.Now()
 	e.errMu.Unlock()
 	raw, _ := json.Marshal(struct {
 		Type  string `json:"type"`

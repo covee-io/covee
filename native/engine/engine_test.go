@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +14,8 @@ import (
 
 	"tailscale.com/ipn"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/packet"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/wgengine/router"
 )
 
@@ -289,6 +292,104 @@ func TestConfigRejectsUnsafeControllerAndSecretErrors(t *testing.T) {
 	raw, code := e.nextEvent(maxEventBytes + 1)
 	if code <= 0 || bytes.Contains(raw, []byte("very-private")) || bytes.Contains(raw, []byte("abc123")) || bytes.Contains(raw, []byte("hskey")) {
 		t.Fatalf("error exposed secret: %q", raw)
+	}
+}
+
+// nameLookup is a DNS packet between a device and the network's name service:
+// a query, or with answer its reply.
+func nameLookup(src netip.Addr, port, id uint16, answer bool) []byte {
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint16(payload, id)
+	if src.Is4() {
+		h := packet.UDP4Header{IP4Header: packet.IP4Header{IPProto: ipproto.UDP, Src: src, Dst: netip.AddrFrom4(nameServiceV4)}, SrcPort: port, DstPort: 53}
+		if answer {
+			h.ToResponse()
+		}
+		return packet.Generate(h, payload)
+	}
+	h := packet.UDP6Header{IP6Header: packet.IP6Header{IPProto: ipproto.UDP, Src: src, Dst: netip.AddrFrom16(nameServiceV6)}, SrcPort: port, DstPort: 53}
+	if answer {
+		h.ToResponse()
+	}
+	return packet.Generate(h, payload)
+}
+
+func TestLookupsWaitingForTheNameServiceAreBounded(t *testing.T) {
+	d := newPacketDevice()
+	defer d.Close()
+	me := netip.MustParseAddr("100.64.0.6")
+	for i := 0; i < maxWaitingLookups; i++ {
+		if err := d.inject(nameLookup(me, uint16(1000+i), 7, false)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.inject(nameLookup(me, 5000, 7, false)); err != nil || len(d.outgoing) != maxWaitingLookups {
+		t.Fatalf("a lookup beyond the limit was passed on: %v, %d queued", err, len(d.outgoing))
+	}
+	// Asking the same question again adds nothing to wait for.
+	if err := d.inject(nameLookup(me, 1000, 7, false)); err != nil || len(d.outgoing) != maxWaitingLookups+1 {
+		t.Fatalf("a repeated lookup was refused: %v, %d queued", err, len(d.outgoing))
+	}
+	// An answer makes room.
+	if _, err := d.Write([][]byte{nameLookup(me, 1001, 7, true)}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.inject(nameLookup(me, 5000, 7, false)); err != nil || len(d.outgoing) != maxWaitingLookups+2 {
+		t.Fatalf("a lookup was refused after an answer made room: %v, %d queued", err, len(d.outgoing))
+	}
+	// Lookups that never got an answer stop counting after a while.
+	d.lookups.mu.Lock()
+	for key := range d.lookups.waiting {
+		d.lookups.waiting[key] = time.Now().Add(-lookupWait - time.Second)
+	}
+	d.lookups.mu.Unlock()
+	if err := d.inject(nameLookup(me, 5001, 7, false)); err != nil || len(d.outgoing) != maxWaitingLookups+3 {
+		t.Fatalf("expired lookups still blocked a new one: %v, %d queued", err, len(d.outgoing))
+	}
+	d.lookups.mu.Lock()
+	left := len(d.lookups.waiting)
+	d.lookups.mu.Unlock()
+	if left != 1 {
+		t.Fatalf("%d lookups still counted after the others expired", left)
+	}
+	// IPv6 lookups count too; other traffic is never held back.
+	key, ok := lookupKey(nameLookup(netip.MustParseAddr("fd7a:115c:a1e0::6"), 2000, 9, false), true)
+	if !ok || key != 2000<<16|9 {
+		t.Fatalf("IPv6 lookup key %x %v", key, ok)
+	}
+	if _, ok := lookupKey(ipv4Packet(), true); ok {
+		t.Fatal("an ICMP packet was taken for a lookup")
+	}
+	other := packet.Generate(packet.UDP4Header{IP4Header: packet.IP4Header{IPProto: ipproto.UDP, Src: me, Dst: netip.MustParseAddr("100.64.0.4")}, SrcPort: 1000, DstPort: 53}, make([]byte, 12))
+	if _, ok := lookupKey(other, true); ok {
+		t.Fatal("DNS to another device was taken for a lookup to the name service")
+	}
+}
+
+func TestAPassingProblemStopsShowingOnceTheConnectionRunsAgain(t *testing.T) {
+	e := fixtureEngine(t, false)
+	e.recordError(errors.New("native network settings acknowledgement timed out"))
+	running := ipn.Running.String()
+	if got := e.currentError(running); got == "" {
+		t.Fatal("a new problem was not reported")
+	}
+	e.errMu.Lock()
+	e.lastErrorAt = time.Now().Add(-staleErrorAge - time.Second)
+	e.errMu.Unlock()
+	if got := e.currentError(ipn.Starting.String()); got == "" {
+		t.Fatal("a problem stopped showing before the connection ran again")
+	}
+	if got := e.currentError(running); got != "" {
+		t.Fatalf("an old problem still showed while running: %q", got)
+	}
+
+	fatal := fixtureEngine(t, false)
+	fatal.failPersistence()
+	fatal.errMu.Lock()
+	fatal.lastErrorAt = time.Now().Add(-time.Hour)
+	fatal.errMu.Unlock()
+	if got := fatal.currentError(running); got != persistenceFailure {
+		t.Fatalf("the failure that stopped the tunnel stopped showing: %q", got)
 	}
 }
 

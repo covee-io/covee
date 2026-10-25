@@ -101,7 +101,13 @@
 
   function expired(value) { return value && !Number.isNaN(Date.parse(value)) && Date.parse(value) < Date.now(); }
   function deviceName(device) { return device.name || device.hostname || 'Device ' + device.id; }
-  function userName(user) { return user.displayName || user.name || 'User ' + user.id; }
+  function userName(user) { return user.displayName || user.email || user.name || 'User ' + user.id; }
+  // In lists of people, the email tells two people with one name apart. Someone
+  // who has not signed in since sign-ins brought emails is told apart by ID.
+  function userLabel(user) {
+    const name = userName(user), detail = user.email || (user.displayName ? user.name : '');
+    return detail && detail !== name ? name + ' · ' + detail : name;
+  }
   function deviceStatus(device) {
     if (device.expired) return badge('Expired', 'warning');
     const node = badge(device.online ? 'Online' : 'Offline', device.online ? 'success' : '');
@@ -448,7 +454,7 @@
         const row = el('tr');
         const actions = el('div', 'button-row');
         actions.append(writeButton('Create key', () => { state.userId = String(user.id); createKey(users); }, 'quiet small'), writeButton('Remove', () => confirmUserDelete(user), 'quiet small'));
-        row.append(cell(identity(userName(user), user.name, 'users')), cell(user.email), cell(friendlyDate(user.createdAt)), cell(actions, 'action-cell'));
+        row.append(cell(identity(userName(user), user.email ? '' : user.name, 'users')), cell(user.email), cell(friendlyDate(user.createdAt)), cell(actions, 'action-cell'));
         return row;
       });
       section.append(table(['Person', 'Email', 'Added', 'Actions'], rows, 'Network users'));
@@ -524,7 +530,15 @@
     const help = el('aside', 'policy-note'); help.id = 'policy-help';
     const first = el('div'); first.append(el('h2', '', 'A deliberate change.'), el('p', '', 'Review your rules before saving. Changes to the policy can affect which devices are able to connect.'), el('p', '', 'The policy is checked when you save. Invalid changes are not applied.'));
     const second = el('div'); second.append(el('h2', '', 'Keep your draft.'), el('p', '', 'This editor does not save automatically. Changes through this console are checked for conflicts before saving.'), el('p', '', 'Copy your draft before refreshing after a conflict.'));
-    help.append(first, el('hr'), second);
+    // Tailscale SSH: servers running `tailscale set --ssh` let people in by their network identity.
+    const sshRule = el('div', 'secret-box commands', '{"action": "accept", "src": ["autogroup:member"], "dst": ["tag:server"], "users": ["autogroup:nonroot"]}');
+    sshRule.tabIndex = 0;
+    const sshStatus = el('span', 'copy-status');
+    const third = el('div');
+    third.append(el('h2', '', 'Sign in to servers without keys.'),
+      el('p', '', 'A server that runs Tailscale with SSH turned on (tailscale set --ssh) lets people in by their network identity, with no key or password, from Covee on a Mac or iPhone. This rule, in the ssh list, lets everyone sign in to servers tagged tag:server as any user but root:'),
+      sshRule, copyButton('Copy rule', sshRule, sshStatus, 'Copied.'), sshStatus);
+    help.append(first, el('hr'), second, el('hr'), third);
     layout.append(main, help);
     editor.addEventListener('input', () => {
       if (!state.canWrite) return;
@@ -582,8 +596,10 @@
   // and which DNS names go to private resolvers. Every save sends the whole
   // settings with the revision they were loaded at.
   async function gatewayView(epoch) {
-    const data = await api('/api/gateway');
+    const [data, people] = await Promise.all([api('/api/gateway'), api('/api/users').catch(() => null)]);
     if (!current(epoch)) return;
+    const person = new Map();
+    for (const user of people?.users || []) { person.set(user.name, user); if (user.email) person.set(user.email, user); }
     if (!data.enabled) {
       const section = panel('No gateway yet', 'A gateway lets your devices reach places only the server can, such as a cloud\u2019s private networks.');
       section.append(empty('This network has no gateway', 'Turn it on from the computer that manages the network with covee gateway <network>, then return here.', 'gateway'));
@@ -618,7 +634,7 @@
         const mine = (status.routes || []).filter(route => (route.entries || []).includes(entry.id));
         const ready = mine.filter(route => route.approved).length;
         const routeBadge = !mine.length ? badge('No addresses yet', 'warning') : ready === mine.length ? badge('Active', 'success') : badge(ready + ' of ' + mine.length + ' active', 'warning');
-        const who = entry.users && entry.users.length ? entry.users.join(', ') : 'Everyone in the network';
+        const who = entry.users && entry.users.length ? entry.users.map(name => person.has(name) ? userName(person.get(name)) : name).join(', ') : 'Everyone in the network';
         const actions = el('div', 'button-row');
         actions.append(writeButton('Edit', () => editGatewayEntry(entry), 'quiet small'), writeButton('Remove', () => removeGatewayEntry(entry), 'quiet small'));
         row.append(cell(entry.label), cell(list), cell(who), cell(routeBadge), cell(actions, 'action-cell'));
@@ -676,7 +692,7 @@
     const people = el('div', 'route-section'); people.id = 'gateway-people';
     const chosen = new Set(entry ? entry.users : []);
     const boxes = users.map((user, index) => {
-      const box = checkbox(people, userName(user) + (user.displayName ? ' \u00b7 ' + user.name : ''), 'person-' + index);
+      const box = checkbox(people, userLabel(user), 'person-' + index);
       box.checked = chosen.has(user.name) || (user.email && chosen.has(user.email));
       box.dataset.name = user.name;
       return box;
@@ -783,7 +799,7 @@
 
   function userSelect(users, id) {
     const select = el('select'); select.id = id;
-    for (const user of users) { const option = el('option', '', userName(user) + (user.displayName ? ' · ' + user.name : '')); option.value = String(user.id); select.append(option); }
+    for (const user of users) { const option = el('option', '', userLabel(user)); option.value = String(user.id); select.append(option); }
     return select;
   }
 

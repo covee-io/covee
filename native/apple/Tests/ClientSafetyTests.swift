@@ -144,4 +144,59 @@ final class ClientSafetyTests: XCTestCase {
         }
         XCTAssertNil(ProviderStatus.empty.consoleURL)
     }
+
+    func testSavedNetworksPutTheLatestFirstAndOfferTheExtensionsSignIns() throws {
+        var saved = SavedNetworks()
+        saved.remember(ClientConfiguration(controlURL: "https://Control.Example.com/", hostname: "Phone"), suffix: "home.example.com.")
+        saved.add([KnownNetwork(controlURL: "https://control.example.com", suffix: "ignored.example"),
+                   KnownNetwork(controlURL: "https://office.example.org", suffix: "mesh.office.example.org"),
+                   KnownNetwork(controlURL: "http://insecure.example.net")], hostname: "phone")
+        XCTAssertEqual(saved.networks.map(\.controlURL), ["https://control.example.com", "https://office.example.org"])
+        XCTAssertEqual(saved.networks.first?.suffix, "home.example.com", "the connected network's own suffix stays")
+        XCTAssertEqual(saved.networks.first?.hostname, "phone")
+        XCTAssertEqual(saved.networks.first?.host, "control.example.com")
+
+        saved.remember(ClientConfiguration(controlURL: "https://office.example.org", hostname: "work-phone"), suffix: nil)
+        XCTAssertEqual(saved.networks.map(\.host), ["office.example.org", "control.example.com"])
+        XCTAssertEqual(saved.networks.first?.hostname, "work-phone")
+        XCTAssertEqual(saved.networks.first?.suffix, "mesh.office.example.org", "a known suffix is kept")
+
+        let office = try XCTUnwrap(saved.networks.first)
+        saved.forget(office)
+        saved.add([KnownNetwork(controlURL: "https://office.example.org")], hostname: "phone")
+        XCTAssertEqual(saved.networks.map(\.host), ["control.example.com"], "a forgotten sign-in is not offered again")
+        saved.remember(ClientConfiguration(controlURL: "https://office.example.org", hostname: "phone"), suffix: nil)
+        XCTAssertEqual(saved.networks.map(\.host), ["office.example.org", "control.example.com"], "connecting by address brings it back")
+
+        for index in 0..<(SavedNetworks.limit + 2) {
+            saved.remember(ClientConfiguration(controlURL: "https://n\(index).example.com", hostname: "phone"), suffix: nil)
+        }
+        XCTAssertEqual(saved.networks.count, SavedNetworks.limit)
+        XCTAssertEqual(saved.networks.first?.host, "n\(SavedNetworks.limit + 1).example.com")
+
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "covee.tests.networks." + UUID().uuidString))
+        let store = ConfigurationStore(defaults: defaults)
+        XCTAssertEqual(store.loadNetworks(), SavedNetworks())
+        store.saveNetworks(saved)
+        XCTAssertEqual(store.loadNetworks(), saved)
+    }
+
+    func testConnectionHistoryDecodesAndOlderExtensionsStillDecode() throws {
+        let older = try JSONDecoder().decode(ProviderStatus.self, from: Data(#"{"backendState":"Running","ips":[],"peers":[]}"#.utf8))
+        XCTAssertNil(older.history)
+        XCTAssertNil(older.memoryMB)
+        XCTAssertNil(older.networks)
+        let signIns = try JSONDecoder().decode(ProviderStatus.self, from: Data(#"{"backendState":"Running","ips":[],"peers":[],"networks":[{"controlURL":"https://control.example.com","suffix":"home.example.com"},{"controlURL":"https://office.example.org"}]}"#.utf8))
+        XCTAssertEqual(signIns.networks, [KnownNetwork(controlURL: "https://control.example.com", suffix: "home.example.com"),
+                                          KnownNetwork(controlURL: "https://office.example.org")])
+        let current = try JSONDecoder().decode(ProviderStatus.self, from: Data(#"""
+        {"backendState":"Running","ips":[],"peers":[],"memoryMB":23,"history":[
+          {"at":"2026-10-24T21:22:35Z","text":"Another VPN took over. The device runs one VPN at a time."},
+          {"at":"2026-10-24T21:23:01Z","text":"Started by the system: reconnecting by itself, or from Settings."}]}
+        """#.utf8))
+        XCTAssertEqual(current.memoryMB, 23)
+        XCTAssertEqual(current.history?.count, 2)
+        XCTAssertEqual(current.history?.first?.date, Date(timeIntervalSince1970: 1_792_876_955))
+        XCTAssertNotEqual(current.history?.first?.id, current.history?.last?.id)
+    }
 }

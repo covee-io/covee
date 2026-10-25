@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"cmp"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -51,6 +52,8 @@ type identityClaims struct {
 	Subject         string   `json:"sub"`
 	Username        string   `json:"preferred_username"`
 	Name            string   `json:"name"`
+	Email           string   `json:"email,omitempty"`
+	EmailVerified   bool     `json:"email_verified,omitempty"`
 	Roles           []string `json:"roles,omitempty"`
 	Groups          []string `json:"groups,omitempty"`
 	UpstreamIssuer  string   `json:"upstream_issuer"`
@@ -179,6 +182,11 @@ func newWithClient(ctx context.Context, c Config, client *http.Client) (*Server,
 		}
 		endpoint.AuthStyle = oauth2.AuthStyleInParams
 		u := &upstream{config: p, issuer: issuer, oauth: oauth2.Config{ClientID: p.ClientID, RedirectURL: c.Issuer + "/callback/" + p.ID, Endpoint: endpoint, Scopes: []string{oidc.ScopeOpenID, oidc.ScopeProfile}}, verifier: provider.VerifierContext(oidc.ClientContext(context.Background(), client), &oidc.Config{ClientID: p.ClientID, SupportedSigningAlgs: []string{oidc.RS256}})}
+		// Entra's profile scope already carries the sign-in name; asking it for
+		// email as well could make every member consent to the app again.
+		if p.ID == "google" {
+			u.oauth.Scopes = append(u.oauth.Scopes, oidc.ScopeEmail)
+		}
 		if p.ID == "apple" {
 			u.appleKey, err = readAppleKey(p.PrivateKeyFile)
 			u.oauth.Scopes = []string{oidc.ScopeOpenID, oidc.ScopeEmail}
@@ -561,12 +569,16 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	var claims struct {
-		Roles      []string                   `json:"roles"`
-		Groups     []string                   `json:"groups"`
-		AZP        string                     `json:"azp"`
-		NBF        int64                      `json:"nbf"`
-		HasGroups  json.RawMessage            `json:"hasgroups"`
-		ClaimNames map[string]json.RawMessage `json:"_claim_names"`
+		Roles             []string                   `json:"roles"`
+		Groups            []string                   `json:"groups"`
+		AZP               string                     `json:"azp"`
+		NBF               int64                      `json:"nbf"`
+		HasGroups         json.RawMessage            `json:"hasgroups"`
+		ClaimNames        map[string]json.RawMessage `json:"_claim_names"`
+		Email             string                     `json:"email"`
+		EmailVerified     json.RawMessage            `json:"email_verified"`
+		Name              string                     `json:"name"`
+		PreferredUsername string                     `json:"preferred_username"`
 	}
 	if verified.Claims(&claims) != nil || claims.NBF > now.Unix() || (claims.AZP != "" && claims.AZP != u.config.ClientID) || (len(verified.Audience) > 1 && claims.AZP != u.config.ClientID) {
 		deny(w, 400, "authentication_failed")
@@ -596,10 +608,20 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request, id string) {
 	} else if grant, ok := s.grants[id+"\x00"+verified.Subject]; ok {
 		role, enroll = grant.Role, grant.Enroll
 	}
+	// The address and name only label the person; access above came from the
+	// subject alone. Google and Apple say whether they verified the address.
+	// Entra's sign-in name is managed by the tenant's own directory, and its
+	// email claim is present for guests.
+	who := displayProfile("", claims.Name)
+	if id == "entra" {
+		who.email = cmp.Or(plainAddress(claims.Email), plainAddress(claims.PreferredUsername))
+	} else if string(claims.EmailVerified) == "true" || string(claims.EmailVerified) == `"true"` {
+		who.email = plainAddress(claims.Email)
+	}
 	// Google permits both its legacy bare issuer and HTTPS issuer in signed
 	// tokens. Use the configured, verified provider issuer as the namespace so
 	// a subject remains stable across those equivalent forms.
-	target, err := s.issue(pending, u.issuer, verified.Subject, role, enroll)
+	target, err := s.issue(pending, u.issuer, verified.Subject, role, enroll, who)
 	s.finishHTML(w, r, target, err, providerName(id), verified.Subject)
 }
 
@@ -670,6 +692,9 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	expires := now.Add(lifetime)
 	claims := map[string]any{"iss": s.config.Issuer, "aud": id, "sub": entry.claims.Subject, "iat": now.Unix(), "exp": expires.Unix(), "nonce": entry.nonce, "preferred_username": entry.claims.Username, "name": entry.claims.Name, "upstream_issuer": entry.claims.UpstreamIssuer, "upstream_sub": entry.claims.UpstreamSubject}
+	if entry.claims.Email != "" {
+		claims["email"], claims["email_verified"] = entry.claims.Email, true
+	}
 	if len(entry.claims.Roles) > 0 {
 		claims["roles"] = entry.claims.Roles
 	}

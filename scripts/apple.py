@@ -15,6 +15,9 @@ ENGINE = ROOT / "native/engine"
 APPLE = ROOT / "native/apple"
 CACHE = ROOT / ".cache/covee/apple"
 REPORT = CACHE / "build-results.json"
+# SwiftTerm makes its version string with a package build plugin; without these
+# flags xcodebuild stops and waits for the plugin to be trusted in Xcode.
+PACKAGE_FLAGS = ["-skipPackagePluginValidation", "-skipMacroValidation"]
 PLATFORMS = {
     "macos": ("macosx", "darwin", "arm64-apple-macos15.0", "Covee-macOS", "platform=macOS,arch=arm64"),
     "ios": ("iphoneos", "ios", "arm64-apple-ios18.0", "Covee-iOS", "generic/platform=iOS"),
@@ -77,19 +80,22 @@ def build(platform, report, configuration):
     previous_bundle = CACHE / "derived" / platform / "Build/Products" / product_folder / "Covee.app"
     if previous_bundle.exists():
         shutil.rmtree(previous_bundle)
+    # The destination picks each target's SDK. Forcing one with -sdk would also
+    # build package build tools (SwiftTerm's) for the device instead of this Mac.
     run(["xcodebuild", "-project", str(APPLE / "Covee.xcodeproj"), "-scheme", scheme,
-         "-configuration", configuration, "-sdk", sdk, "-destination", destination,
+         "-configuration", configuration, "-destination", destination,
          "-derivedDataPath", str(CACHE / "derived" / platform), "ARCHS=arm64", "ONLY_ACTIVE_ARCH=YES",
-         "CODE_SIGNING_ALLOWED=NO", "build"], "app-" + platform, report)
+         "CODE_SIGNING_ALLOWED=NO", *PACKAGE_FLAGS, "build"], "app-" + platform, report)
 
 
 def test(report, configuration):
-    # Both are unhosted unit bundles; these tests never save or start a VPN.
-    for scheme in ("CoveeCoreTests", "CoveePacketTunnelTests"):
+    # Unhosted unit bundles; these tests never save or start a VPN. The remote
+    # access tests run an SSH server on 127.0.0.1 in the test itself.
+    for scheme in ("CoveeCoreTests", "CoveePacketTunnelTests", "CoveeRemoteTests"):
         run(["xcodebuild", "-project", str(APPLE / "Covee.xcodeproj"), "-scheme", scheme,
              "-configuration", configuration,
              "-destination", "platform=macOS,arch=arm64", "-derivedDataPath", str(CACHE / "tests"),
-             "CODE_SIGNING_ALLOWED=NO", "test"], "test-" + scheme, report)
+             "CODE_SIGNING_ALLOWED=NO", *PACKAGE_FLAGS, "test"], "test-" + scheme, report)
 
 
 def main():

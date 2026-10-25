@@ -56,7 +56,11 @@ struct ClientRootView: View {
         case .network:
             NetworkView(controller: controller, enrollmentKey: $enrollmentKey)
         case .devices:
+            #if os(macOS)
+            NavigationStack { DevicesView(controller: controller) }
+            #else
             DevicesView(controller: controller)
+            #endif
         case .settings:
             SettingsView(controller: controller, enrollmentKey: $enrollmentKey)
         }
@@ -83,13 +87,17 @@ private struct NetworkView: View {
                     }
                     Spacer(minLength: 0)
                 }
+                if !controller.active, !controller.savedNetworks.networks.isEmpty {
+                    SavedNetworksSection(controller: controller)
+                }
                 if !controller.active {
                     ConfigurationFields(controller: controller, enrollmentKey: $enrollmentKey)
                 }
                 HStack {
                     if controller.active {
-                        Button("Disconnect", systemImage: "stop.circle") { controller.disconnect() }
+                        Button("Disconnect", systemImage: "stop.circle") { Task { await controller.disconnect() } }
                             .buttonStyle(.bordered).disabled(controller.isBusy)
+                        SwitchNetworkMenu(controller: controller)
                     } else {
                         Button("Connect", systemImage: "arrow.right.circle") { startConnection() }
                             .buttonStyle(.borderedProminent).disabled(controller.isBusy)
@@ -143,6 +151,64 @@ private struct NetworkView: View {
         let transientKey = enrollmentKey
         enrollmentKey = ""
         Task { await controller.connect(authKey: transientKey) }
+    }
+}
+
+/// The networks this device has used, each one tap away.
+private struct SavedNetworksSection: View {
+    @ObservedObject var controller: TunnelController
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Your networks", systemImage: "list.bullet").font(.headline).padding(.bottom, 6)
+                ForEach(controller.savedNetworks.networks) { network in
+                    Button { Task { await controller.connect(to: network) } } label: {
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(network.host).font(.body.weight(.semibold))
+                                Text([network.suffix, "as " + network.hostname].compactMap { $0 }.joined(separator: " · "))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "arrow.right.circle").foregroundStyle(Color.accentColor)
+                        }
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(controller.isBusy)
+                    .contextMenu {
+                        Button("Forget", systemImage: "trash", role: .destructive) { controller.forget(network) }
+                    }
+                    .accessibilityLabel("Connect to \(network.host)")
+                }
+                #if os(macOS)
+                Text("Control-click a network to forget it.").font(.caption).foregroundStyle(.secondary)
+                #else
+                Text("Touch and hold a network to forget it.").font(.caption).foregroundStyle(.secondary)
+                #endif
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
+        }
+    }
+}
+
+/// Leaves this network for another the device has used.
+private struct SwitchNetworkMenu: View {
+    @ObservedObject var controller: TunnelController
+
+    var body: some View {
+        let others = controller.savedNetworks.networks.filter { $0.controlURL != controller.currentControlURL }
+        if !others.isEmpty {
+            Menu {
+                ForEach(others) { network in
+                    Button(network.host) { Task { await controller.connect(to: network) } }
+                }
+            } label: {
+                Label("Switch network", systemImage: "arrow.left.arrow.right")
+            }
+            .disabled(controller.isBusy)
+        }
     }
 }
 
@@ -256,6 +322,7 @@ private struct ConfigurationFields: View {
 private struct SettingsView: View {
     @ObservedObject var controller: TunnelController
     @Binding var enrollmentKey: String
+    @State private var showsAcknowledgements = false
 
     var body: some View {
         ScrollView {
@@ -274,11 +341,110 @@ private struct SettingsView: View {
                     Toggle("Use the network’s gateway", isOn: Binding(get: { controller.usesGatewayRoutes }, set: { accept in
                         Task { await controller.setAcceptRoutes(accept) }
                     })).disabled(controller.changingExitNode)
-                    Text("On: reach what your network’s admin sends through its gateway, such as private cloud networks, and local networks other devices share. Off: only the devices in your network. Choose an internet exit node on the Network page while connected. Connection on demand is not configured in this build.")
+                    Text("On: reach what your network’s admin sends through its gateway, such as private cloud networks, and local networks other devices share. Off: only the devices in your network. Choose an internet exit node on the Network page while connected.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("Covee stays connected. If the connection stops for any reason but Disconnect, it starts again by itself.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
+                ConnectionHistoryView(status: controller.providerStatus)
+                Divider()
+                RemoteAccessSettings(hostname: controller.configuration.hostname)
+                Divider()
+                Button("Open-source software") { showsAcknowledgements = true }
+                    .buttonStyle(.borderless)
             }.padding(24).frame(maxWidth: 720, alignment: .leading).frame(maxWidth: .infinity)
-        }.navigationTitle("Settings")
+        }
+        .navigationTitle("Settings")
+        .sheet(isPresented: $showsAcknowledgements) { AcknowledgementsView { showsAcknowledgements = false } }
+    }
+}
+
+/// Covee's SSH key, for adding it to a device by hand.
+private struct RemoteAccessSettings: View {
+    let hostname: String
+    @State private var copied = false
+    @State private var problem: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Terminal and screen sharing", systemImage: "terminal").font(.headline)
+            Text("Open a device under Devices to start a terminal on it or share its screen. Covee signs in over SSH with a key made on this device and kept in its Secure Enclave, where it has one. Servers running Tailscale SSH let you in with your network identity instead.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Button(copied ? "Copied" : "Copy Covee's SSH key", systemImage: "key") { copyKey() }
+                .buttonStyle(.bordered)
+            Text("Add it to ~/.ssh/authorized_keys on a device to sign in without a password. Covee can also install it for you after you sign in once with a password.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let problem { Text(problem).font(.caption).foregroundStyle(.red) }
+        }
+    }
+
+    private func copyKey() {
+        do {
+            let line = try SSHIdentity.authorizedKeysLine(deviceName: hostname.isEmpty ? "device" : hostname)
+            #if os(iOS)
+            UIPasteboard.general.string = line
+            #else
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(line, forType: .string)
+            #endif
+            copied = true
+            problem = nil
+        } catch {
+            problem = error.localizedDescription
+        }
+    }
+}
+
+/// The licenses of the open-source software in Covee.
+private struct AcknowledgementsView: View {
+    var close: () -> Void
+    private let text: String = {
+        guard let url = Bundle.main.url(forResource: "Acknowledgements", withExtension: "txt"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return "The license list is missing from this build." }
+        return text
+    }()
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(text)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .navigationTitle("Open-source software")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done", action: close) } }
+        }
+        #if os(macOS)
+        .frame(minWidth: 620, minHeight: 520)
+        #endif
+    }
+}
+
+/// How recent connections started and ended, newest first, while the network
+/// extension runs and can tell.
+private struct ConnectionHistoryView: View {
+    let status: ProviderStatus
+
+    var body: some View {
+        if let history = status.history, !history.isEmpty {
+            Divider()
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Connection history", systemImage: "clock.arrow.circlepath").font(.headline)
+                ForEach(history.reversed()) { event in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(event.date?.formatted(date: .abbreviated, time: .shortened) ?? event.at)
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text(event.text).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let memory = status.memoryMB {
+                    Text("Covee’s network extension uses \(memory) MB of memory now.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 }
 
@@ -308,27 +474,34 @@ private struct DevicesView: View {
                 ContentUnavailableView("No visible devices", systemImage: "desktopcomputer", description: Text("Your coordinator has not shared any other devices with this device."))
             } else {
                 List(controller.providerStatus.peers) { peer in
-                    HStack(alignment: .top, spacing: 12) {
-                        Image(systemName: "desktopcomputer").foregroundStyle(.secondary).frame(width: 28)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(peer.name).font(.headline)
-                            Text(peer.ips.joined(separator: " · ")).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
-                            if !peer.subnetRoutes.isEmpty {
-                                Text("Local networks: " + peer.subnetRoutes.joined(separator: " · ")).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
-                            }
-                            if peer.exitNode == true {
-                                Label("Exit node in use", systemImage: "globe").font(.caption).foregroundStyle(.secondary)
-                            } else if peer.offersExitNode {
-                                Label("Offers an exit node", systemImage: "globe").font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
-                        Spacer()
-                        Label(peer.online ? "Online" : "Offline", systemImage: peer.online ? "circle.fill" : "circle")
-                            .font(.caption).foregroundStyle(peer.online ? Color.green : Color.secondary)
-                    }.padding(.vertical, 8)
+                    NavigationLink { DeviceDetailView(peerID: peer.id, controller: controller) } label: { DeviceRow(peer: peer) }
                 }
                 .refreshable { await controller.refreshStatus() }
             }
         }.navigationTitle("Devices")
+    }
+}
+
+private struct DeviceRow: View {
+    let peer: PeerStatus
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: peer.os?.lowercased() == "ios" ? "iphone" : "desktopcomputer").foregroundStyle(.secondary).frame(width: 28)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(peer.name).font(.headline)
+                Text(peer.ips.joined(separator: " · ")).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                if !peer.subnetRoutes.isEmpty {
+                    Text("Local networks: " + peer.subnetRoutes.joined(separator: " · ")).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                }
+                if peer.exitNode == true {
+                    Label("Exit node in use", systemImage: "globe").font(.caption).foregroundStyle(.secondary)
+                } else if peer.offersExitNode {
+                    Label("Offers an exit node", systemImage: "globe").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Label(peer.online ? "Online" : "Offline", systemImage: peer.online ? "circle.fill" : "circle")
+                .font(.caption).foregroundStyle(peer.online ? Color.green : Color.secondary)
+        }.padding(.vertical, 8)
     }
 }

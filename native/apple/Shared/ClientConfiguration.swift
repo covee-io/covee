@@ -80,8 +80,74 @@ enum EnrollmentKey {
     }
 }
 
+/// A coordinator the network extension has a saved sign-in for.
+struct KnownNetwork: Codable, Equatable {
+    let controlURL: String
+    /// The network's device name suffix, such as mesh.example.com.
+    var suffix: String? = nil
+}
+
+/// The networks this device has connected to, most recent first, so that
+/// switching between them needs no typing.
+struct SavedNetworks: Codable, Equatable {
+    struct Network: Codable, Equatable, Identifiable {
+        var controlURL: String
+        var hostname: String
+        /// The network's device name suffix, such as mesh.example.com, once known.
+        var suffix: String?
+
+        var id: String { controlURL }
+        /// The coordinator's host name, such as control.example.com.
+        var host: String { URLComponents(string: controlURL)?.host ?? controlURL }
+    }
+
+    static let limit = 8
+    private(set) var networks: [Network] = []
+    /// Networks the person removed. The extension's saved sign-ins for them are
+    /// not offered again until the person connects to one by its address.
+    private(set) var forgotten: [String] = []
+
+    /// The network just connected to comes first.
+    mutating func remember(_ configuration: ClientConfiguration, suffix: String?) {
+        guard let checked = try? configuration.validated() else { return }
+        let previous = networks.first { $0.controlURL == checked.controlURL }
+        networks.removeAll { $0.controlURL == checked.controlURL }
+        networks.insert(Network(controlURL: checked.controlURL, hostname: checked.hostname,
+                                suffix: Self.suffix(suffix) ?? previous?.suffix), at: 0)
+        if networks.count > Self.limit { networks.removeLast(networks.count - Self.limit) }
+        forgotten.removeAll { $0 == checked.controlURL }
+    }
+
+    /// Adds the networks the extension has a saved sign-in for, after those
+    /// already here, with this device name.
+    mutating func add(_ known: [KnownNetwork], hostname: String) {
+        for item in known {
+            guard let checked = try? ClientConfiguration(controlURL: item.controlURL, hostname: hostname).validated(),
+                  !forgotten.contains(checked.controlURL) else { continue }
+            if let index = networks.firstIndex(where: { $0.controlURL == checked.controlURL }) {
+                if networks[index].suffix == nil { networks[index].suffix = Self.suffix(item.suffix) }
+            } else if networks.count < Self.limit {
+                networks.append(Network(controlURL: checked.controlURL, hostname: checked.hostname, suffix: Self.suffix(item.suffix)))
+            }
+        }
+    }
+
+    mutating func forget(_ network: Network) {
+        networks.removeAll { $0.controlURL == network.controlURL }
+        forgotten.removeAll { $0 == network.controlURL }
+        forgotten.append(network.controlURL)
+        if forgotten.count > 32 { forgotten.removeFirst(forgotten.count - 32) }
+    }
+
+    private static func suffix(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)).lowercased()
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+}
+
 struct ConfigurationStore {
     static let key = "covee.client.configuration.v1"
+    static let networksKey = "covee.client.networks.v1"
     let defaults: UserDefaults
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
     func load() -> ClientConfiguration {
@@ -94,5 +160,13 @@ struct ConfigurationStore {
     func save(_ configuration: ClientConfiguration) throws {
         let checked = try configuration.validated()
         defaults.set(try JSONEncoder().encode(checked), forKey: Self.key)
+    }
+    func loadNetworks() -> SavedNetworks {
+        guard let data = defaults.data(forKey: Self.networksKey),
+              let value = try? JSONDecoder().decode(SavedNetworks.self, from: data) else { return SavedNetworks() }
+        return value
+    }
+    func saveNetworks(_ networks: SavedNetworks) {
+        if let data = try? JSONEncoder().encode(networks) { defaults.set(data, forKey: Self.networksKey) }
     }
 }

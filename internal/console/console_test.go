@@ -23,6 +23,12 @@ func TestConsoleRoutesServeHTMLWithoutRedirect(t *testing.T) {
 			if w.Header().Get("Cache-Control") != "no-store" {
 				t.Fatal("console must not cache authenticated view state")
 			}
+			// Under no-referrer, Safari sends the console's same-origin POSTs
+			// (sign-in among them) with "Origin: null", which the management
+			// service refuses: the sign-in failed on iPhone.
+			if got := w.Header().Get("Referrer-Policy"); got != "same-origin" {
+				t.Fatalf("console Referrer-Policy %q", got)
+			}
 		})
 	}
 }

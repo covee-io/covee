@@ -96,6 +96,52 @@ Summary for network office (Example Co):
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3Z"/></svg>
           <div><h3>Exit nodes and shared networks</h3><p>A device can send others' internet traffic out through itself, or share the network behind it, once an administrator approves it.</p></div>
         </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 3v5h5"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 21v-5h-5"/></svg>
+          <div><h3>Stays connected</h3><p>Covee for Mac and iPhone reconnect by themselves after sleep, a network change or a server restart, and keep a short history of why a connection ended.</p></div>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5Z"/><path d="m3 13 9 5 9-5"/></svg>
+          <div><h3>Your networks, one tap apart</h3><p>Home, work, a client's network: the apps remember each one and its sign-in, so moving between them takes one tap instead of an address.</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="remote">
+    <div class="wrap split">
+      <div>
+        <div class="section-head">
+          <h2>Every device, a tap away.</h2>
+          <p>Open a terminal on any computer in your network, or see its screen, from Covee for Mac or iPhone. No addresses to look up, no ports to open, and nothing sent outside your network.</p>
+        </div>
+        <ul class="checks">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4 10-10"/></svg><span><strong>A terminal with no keys to copy.</strong> Servers running Tailscale SSH let you in with your network identity. Elsewhere Covee signs in with its own key, kept in your device's Secure Enclave.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4 10-10"/></svg><span><strong>Screen sharing.</strong> On iPhone and iPad the screen opens right in Covee, with touch, zoom and a keyboard with modifier keys; on a Mac, in Apple's Screen Sharing.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4 10-10"/></svg><span><strong>Every device checked.</strong> Covee confirms a device's identity the first time and refuses to connect if it ever changes.</span></li>
+        </ul>
+      </div>
+      <div class="device-demo" role="img" aria-label="Covee's page for a server, and a terminal on it signed in without a key or password">
+        <div class="device-card">
+          <div class="who">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+            <div><strong>build-server</strong><span>linux · 100.64.0.12</span></div>
+            <span class="pill">Online</span>
+          </div>
+          <div class="device-actions">
+            <span class="action primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 4 4-4 4"/><path d="M12 17h7"/></svg>Open terminal</span>
+            <span class="action"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>Share screen</span>
+          </div>
+          <p>Signs in with your network identity: no key or password.</p>
+        </div>
+        <div class="terminal">
+          <div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="d">Signed in to build-server with your network identity.</span>
+
+<span class="p">alex@build-server:~$</span> uptime
+ 21:14:03 up 12 days,  3:02,  1 user,  load average: 0.08, 0.05, 0.01
+<span class="p">alex@build-server:~$</span> <span class="cursor"></span></pre>
+        </div>
       </div>
     </div>
   </section>
@@ -169,13 +215,13 @@ Summary for network office (Example Co):
         <div class="platform">
           <span class="tag">Apple silicon · macOS 15+</span>
           <h3>Covee for Mac</h3>
-          <p>A menu bar app with sign-in, exit nodes and the gateway switch. Signed with a Developer ID and notarized by Apple.</p>
+          <p>A menu bar app that stays connected: sign-in, your saved networks, exit nodes, the gateway switch, and a terminal and screen sharing for every device. Signed with a Developer ID and notarized by Apple.</p>
           <p><a href="https://github.com/covee-io/covee/releases/latest/download/Covee.dmg">Download Covee.dmg</a>, or <code>brew install --cask covee-io/tap/covee</code></p>
         </div>
         <div class="platform">
           <span class="tag">iOS</span>
           <h3>iPhone</h3>
-          <p>Covee for iPhone is in testing. Meanwhile, Tailscale's iPhone app joins your network once your server is set as its coordination server.</p>
+          <p>Covee for iPhone and iPad is in testing, with the Mac app's features and screen sharing built in. Meanwhile, Tailscale's iPhone app joins your network once your server is set as its coordination server.</p>
           <p><a href="docs/devices.html#iphone">How to set it up</a></p>
         </div>
         <div class="platform">

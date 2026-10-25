@@ -10,6 +10,9 @@ private let providerLog = Logger(subsystem: "io.covee.tunnel", category: "provid
 /// coordinator has asked the person to sign in in their browser.
 private let startupSeconds: Double = 90
 private let signInSeconds: Double = 600
+/// The start option the Covee app sets (TunnelController.startedByAppOption);
+/// other starts are the system reconnecting by itself, or Settings.
+private let startedByAppOption = "coveeStartedByApp"
 
 /// Owns the actual engine and raw IP packet bridge. No host routing or DNS is
 /// changed by the engine; Apple applies only the settings acknowledged here.
@@ -32,6 +35,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var settingsApplier: NetworkSettingsApplier?
     private var generation: UInt64 = 0
     private var latestStatus: [String: Any] = ["backendState": "Stopped", "ips": [String](), "peers": [[String: Any]]()]
+    private let history = ConnectionHistory()
+    private var heartbeat: DispatchSourceTimer?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         lock.lock()
@@ -45,6 +50,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         generation &+= 1
         stopRequested = false
         lock.unlock()
+        history.started(byApp: options?[startedByAppOption] != nil)
+        startHeartbeat()
         lifecycle.async { [self] in
             do {
                 guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
@@ -106,6 +113,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 readIncomingPackets(created)
                 guard covee_start(created) == 0 else { throw providerError("The networking engine could not start. Check your coordinator and enrollment key.") }
             } catch {
+                history.failed(error.localizedDescription)
                 finishStart(error)
                 shutdown {}
             }
@@ -116,6 +124,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         lock.lock()
         stopRequested = true
         lock.unlock()
+        history.stopped(reason)
         finishStart(providerError("Connection was cancelled."))
         shutdown(completionHandler)
     }
@@ -124,8 +133,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         switch AppMessage(messageData) {
         case .status?:
             lock.lock()
-            let status = latestStatus
+            var status = latestStatus
             lock.unlock()
+            status["history"] = history.recent(12)
+            if let memory = memoryFootprintMB() { status["memoryMB"] = memory }
             completionHandler?(try? JSONSerialization.data(withJSONObject: status))
         case let .setExitNode(id, allowLAN)?:
             engineRequest(["id": id, "allowLAN": allowLAN], call: covee_set_exit_node, what: "the exit node could be changed") { reply in completionHandler?(try? JSONSerialization.data(withJSONObject: reply)) }
@@ -222,9 +233,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             _ = "Apple rejected the tunnel network settings.".withCString { covee_ack_network(expected, network.generation, $0) }
                             self.fail("Apple could not apply the tunnel routes or DNS settings.")
                         } else {
-                            guard covee_ack_network(expected, network.generation, nil) == 0 else {
-                                self.fail("The tunnel settings acknowledgement expired. Reconnect to try again.")
-                                return
+                            if covee_ack_network(expected, network.generation, nil) != 0 {
+                                // The engine stopped waiting for these settings and sets the
+                                // network again on its next change. Apple applied them, so the
+                                // connection carries on.
+                                providerLog.error("network settings were applied after the engine stopped waiting")
+                                self.history.note("The device applied network settings late; the connection kept running.")
                             }
                             self.lock.lock()
                             self.networkReady = settings != nil
@@ -259,10 +273,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             case "error":
                 if object["code"] as? String == "persistence" {
                     fail("This device's network identity could not be saved securely. The tunnel stopped; check Keychain access before reconnecting.")
-                } else {
-                    fail("The networking engine reported an error. Check your coordinator and enrollment status.")
+                    return
                 }
-                return
+                let detail = (object["error"] as? String) ?? ""
+                lock.lock()
+                let starting = startCompletion != nil
+                lock.unlock()
+                if starting {
+                    fail("The networking engine reported an error. Check your coordinator and enrollment status." + (detail.isEmpty ? "" : " (\(detail))"))
+                    return
+                }
+                // Once connected, the engine recovers from passing problems by
+                // itself, such as the coordinator out of reach for a moment, and
+                // its status shows the problem meanwhile. Stopping here would
+                // drop a working connection.
+                providerLog.error("engine problem: \(detail, privacy: .public)")
+                history.note("A problem the connection kept running through: " + detail)
             default: break
             }
         }
@@ -291,6 +317,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func fail(_ message: String) {
         providerLog.error("\(message, privacy: .public)")
+        history.failed(message)
         let error = providerError(message)
         lock.lock()
         latestStatus = ["backendState": "Error", "ips": [String](), "peers": [[String: Any]](), "error": message]
@@ -344,6 +371,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             lock.unlock()
             completion()
         }
+    }
+
+    /// Checks the memory the extension uses every 10 seconds, and renews the
+    /// running connection's mark in the history with it.
+    private func startHeartbeat() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard heartbeat == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 10, repeating: 10, leeway: .seconds(2))
+        timer.setEventHandler { [weak self] in self?.history.alive(memoryMB: memoryFootprintMB()) }
+        timer.resume()
+        heartbeat = timer
     }
 
     private func providerError(_ message: String) -> NSError {

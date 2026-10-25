@@ -129,6 +129,8 @@ class GatewayTests(unittest.TestCase):
             key.assert_called_once_with(["tag:covee-gateway"], expiration="1h")
         written = [c[1] for c in calls if c[0][:2] == ("policy", "set")]
         self.assertEqual(json.loads(written[0])["tagOwners"], {"tag:covee-gateway": []})
+        # iPhone and Android clients send the gateway's private DNS through the network.
+        self.assertEqual(json.loads(written[0])["nodeAttrs"], [{"target": ["*"], "attr": ["user-dial-routes"]}])
         self.assertEqual([c[0] for c in calls if c[0][:2] == ("nodes", "delete")], [("nodes", "delete", "--identifier", "3", "--force")])
         join = directory / deploy.GATEWAY_STATE / deploy.CONSOLE_JOIN_KEY
         self.assertEqual(join.stat().st_mode & 0o777, 0o600)
@@ -144,6 +146,16 @@ class GatewayTests(unittest.TestCase):
         with patch.object(runtime, "wait"):
             runtime.finish_gateway()
         self.assertFalse(join.exists())
+
+    def test_every_device_dials_routes_for_dns_once(self):
+        text = '{"grants": [], "nodeAttrs": [{"target": ["tag:x"], "attr": ["funnel"]}]}'
+        merged = json.loads(deploy.with_node_attribute(text, deploy.DIAL_ROUTES))
+        self.assertEqual(merged["nodeAttrs"], [{"target": ["tag:x"], "attr": ["funnel"]},
+                                               {"target": ["*"], "attr": ["user-dial-routes"]}])
+        self.assertIsNone(deploy.with_node_attribute(json.dumps(merged), deploy.DIAL_ROUTES), "already given: no write")
+        self.assertIn("user-dial-routes", deploy.with_node_attribute("{}", deploy.DIAL_ROUTES))
+        with self.assertRaises(deploy.DeploymentError):
+            deploy.with_node_attribute('{"nodeAttrs": {}}', deploy.DIAL_ROUTES)
 
     def test_dns_from_the_console_replaces_only_the_split_part(self):
         directory = self.base / "dns"

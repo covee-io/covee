@@ -372,6 +372,23 @@ func TestDeviceDTOOmitsControlPlaneSecrets(t *testing.T) {
 	}
 }
 
+func TestADevicesOwnerReadsAsTheirEmail(t *testing.T) {
+	s := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"nodes":[{"id":"5","name":"laptop","user":{"id":"2","name":"u0a1b","displayName":"Pat Example","email":"pat@example.com"}},{"id":"6","name":"phone","user":{"id":"3","name":"u2c3d","displayName":"Covee user"}},{"id":"7","name":"old","user":{"id":"4","name":"u4e5f"}}]}`)
+	})
+	w := request(s, "GET", "/api/devices", "", bearer(), nil)
+	assertStatus(t, w, 200)
+	var out struct{ Devices []Device }
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil || len(out.Devices) != 3 {
+		t.Fatalf("devices = %s", w.Body.String())
+	}
+	for i, want := range []string{"pat@example.com", "Covee user", "u4e5f"} {
+		if out.Devices[i].UserName != want {
+			t.Fatalf("owner %d = %q, want %q", i, out.Devices[i].UserName, want)
+		}
+	}
+}
+
 func TestUpstreamTypeErrorsAndResponseBound(t *testing.T) {
 	for name, body := range map[string]string{"badID": `{"users":[{"id":"invalid"}]}`, "badBoolean": `{"nodes":[{"id":"1","online":"yes"}]}`, "badArray": `{"users":"not a list"}`, "missingID": `{"users":[{"name":"alice"}]}`, "oversize": `{"ignored":"` + strings.Repeat("a", maxUpstreamResponse) + `"}`} {
 		t.Run(name, func(t *testing.T) {
@@ -395,6 +412,9 @@ func TestRequestBoundsHeadersAndSecureCookie(t *testing.T) {
 	w = request(s, "GET", "/healthz", "", nil, nil)
 	if w.Header().Get("Content-Security-Policy") == "" || w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("X-Frame-Options") != "DENY" {
 		t.Fatal("security headers missing")
+	}
+	if got := w.Header().Get("Referrer-Policy"); got != "same-origin" {
+		t.Fatalf("Referrer-Policy %q: under no-referrer Safari sends the console's requests with Origin: null", got)
 	}
 	s.config.PublicURL = "https://admin.example.test"
 	cookie, _ := login(t, s)
