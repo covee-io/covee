@@ -136,7 +136,7 @@ class PublishedTextTests(unittest.TestCase):
         self.assertIn('sha256 "' + "d" * 64 + '"', cask)
         self.assertIn('url "https://github.com/covee-io/covee/releases/download/v#{version}/Covee.dmg"', cask)
         self.assertIn('app "Covee.app"', cask)
-        self.assertIn('depends_on macos: ">= :sequoia"', cask)
+        self.assertIn('depends_on macos: :sequoia', cask)
 
     def test_notes_warn_about_unsigned_mac_builds_only_when_unsigned(self):
         unsigned = release.release_notes("0.1.0", "c" * 40, "p" * 64, False, release.TARGETS)

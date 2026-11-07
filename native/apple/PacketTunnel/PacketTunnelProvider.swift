@@ -28,6 +28,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var startCompletion: ((Error?) -> Void)?
     private var deadline: DispatchWorkItem?
     private var signInDeadlineSet = false
+    /// The start completed early so that the browser sign-in can reach the
+    /// coordinator (connectForSignIn).
+    private var waitingForSignIn = false
     private var networkReady = false
     private var engineRunning = false
     private var stopRequested = false
@@ -104,6 +107,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let timeout = DispatchWorkItem { [weak self] in self?.startupTimedOut(created) }
                 deadline = timeout
                 signInDeadlineSet = false
+                waitingForSignIn = false
                 lock.unlock()
                 DispatchQueue.global().asyncAfter(deadline: .now() + startupSeconds, execute: timeout)
                 readers.enter()
@@ -192,105 +196,149 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    // These two loops run for the whole connection inside one dispatch block,
+    // so its autorelease pool would never drain: every packet written and every
+    // event parsed (a status each second) left its Foundation objects behind,
+    // about 3.5 KB a second, until Apple ended the extension at its 50 MB limit
+    // some two hours in. Each turn drains its own pool.
     private func readOutgoingPackets(_ expected: Int64) {
         var buffer = [UInt8](repeating: 0, count: 65536)
-        while active(expected) {
-            let count = covee_read_packet(expected, &buffer, Int32(buffer.count))
-            if count <= 0 { break }
-            guard active(expected), Int(count) <= buffer.count else { break }
-            let version = buffer[0] >> 4
-            guard version == 4 || version == 6 else { continue }
-            packetFlow.writePackets([Data(buffer.prefix(Int(count)))], withProtocols: [NSNumber(value: version == 4 ? AF_INET : AF_INET6)])
-        }
+        while active(expected), autoreleasepool(invoking: { writeNextPacket(expected, &buffer) }) {}
+    }
+
+    /// Hands one packet from the engine to Apple; false ends the loop.
+    private func writeNextPacket(_ expected: Int64, _ buffer: inout [UInt8]) -> Bool {
+        let count = covee_read_packet(expected, &buffer, Int32(buffer.count))
+        if count <= 0 { return false }
+        guard active(expected), Int(count) <= buffer.count else { return false }
+        let version = buffer[0] >> 4
+        guard version == 4 || version == 6 else { return true }
+        packetFlow.writePackets([Data(buffer.prefix(Int(count)))], withProtocols: [NSNumber(value: version == 4 ? AF_INET : AF_INET6)])
+        return true
     }
 
     private func readEvents(_ expected: Int64) {
         var buffer = [CChar](repeating: 0, count: 1_048_577)
-        while active(expected) {
-            let count = covee_next_event(expected, &buffer, Int32(buffer.count))
-            if count == 0 { continue }
-            guard count > 0, Int(count) < buffer.count else {
-                if active(expected) { fail("The networking engine stopped unexpectedly.") }
-                break
-            }
-            let data = buffer.withUnsafeBytes { Data($0.prefix(Int(count))) }
-            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let type = object["type"] as? String else {
-                fail("The networking engine returned an invalid event.")
-                break
-            }
-            switch type {
-            case "network":
-                do {
-                    guard let payload = object["network"] else { throw EngineNetwork.SettingsError.invalid }
-                    let network = try JSONDecoder().decode(EngineNetwork.self, from: JSONSerialization.data(withJSONObject: payload))
-                    let settings = try network.settings()
-                    lock.lock()
-                    let applier = settingsApplier
-                    lock.unlock()
-                    applier?.submit(settings) { [weak self] error in
-                        guard let self, self.active(expected) else { return }
-                        if error != nil {
-                            _ = "Apple rejected the tunnel network settings.".withCString { covee_ack_network(expected, network.generation, $0) }
-                            self.fail("Apple could not apply the tunnel routes or DNS settings.")
-                        } else {
-                            if covee_ack_network(expected, network.generation, nil) != 0 {
-                                // The engine stopped waiting for these settings and sets the
-                                // network again on its next change. Apple applied them, so the
-                                // connection carries on.
-                                providerLog.error("network settings were applied after the engine stopped waiting")
-                                self.history.note("The device applied network settings late; the connection kept running.")
-                            }
-                            self.lock.lock()
-                            self.networkReady = settings != nil
-                            self.lock.unlock()
-                            self.completeIfReady()
+        while active(expected), autoreleasepool(invoking: { handleNextEvent(expected, &buffer) }) {}
+    }
+
+    /// Takes one event from the engine; false ends the loop.
+    private func handleNextEvent(_ expected: Int64, _ buffer: inout [CChar]) -> Bool {
+        let count = covee_next_event(expected, &buffer, Int32(buffer.count))
+        if count == 0 { return true }
+        guard count > 0, Int(count) < buffer.count else {
+            if active(expected) { fail("The networking engine stopped unexpectedly.") }
+            return false
+        }
+        let data = buffer.withUnsafeBytes { Data($0.prefix(Int(count))) }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let type = object["type"] as? String else {
+            fail("The networking engine returned an invalid event.")
+            return false
+        }
+        switch type {
+        case "network":
+            do {
+                guard let payload = object["network"] else { throw EngineNetwork.SettingsError.invalid }
+                let network = try JSONDecoder().decode(EngineNetwork.self, from: JSONSerialization.data(withJSONObject: payload))
+                let settings = try network.settings()
+                lock.lock()
+                let applier = settingsApplier
+                lock.unlock()
+                applier?.submit(settings) { [weak self] error in
+                    guard let self, self.active(expected) else { return }
+                    if error != nil {
+                        _ = "Apple rejected the tunnel network settings.".withCString { covee_ack_network(expected, network.generation, $0) }
+                        self.fail("Apple could not apply the tunnel routes or DNS settings.")
+                    } else {
+                        if covee_ack_network(expected, network.generation, nil) != 0 {
+                            // The engine stopped waiting for these settings and sets the
+                            // network again on its next change. Apple applied them, so the
+                            // connection carries on.
+                            providerLog.error("network settings were applied after the engine stopped waiting")
+                            self.history.note("The device applied network settings late; the connection kept running.")
                         }
+                        self.lock.lock()
+                        self.networkReady = settings != nil
+                        self.lock.unlock()
+                        self.completeIfReady()
                     }
-                } catch {
-                    fail("The networking engine supplied invalid routes or DNS settings.")
-                    return
                 }
-            case "status":
-                guard let status = object["status"] as? [String: Any], let backend = status["backendState"] as? String,
-                      status["ips"] is [String], status["peers"] is [[String: Any]] else {
-                    fail("The networking engine supplied an invalid status.")
-                    return
-                }
-                lock.lock()
-                latestStatus = status
-                engineRunning = backend == "Running"
-                // Signing in through the browser takes longer than a normal start.
-                if backend == "NeedsLogin", (status["authURL"] as? String)?.isEmpty == false,
-                   startCompletion != nil, !signInDeadlineSet {
-                    signInDeadlineSet = true
-                    deadline?.cancel()
-                    let timeout = DispatchWorkItem { [weak self] in self?.startupTimedOut(expected) }
-                    deadline = timeout
-                    DispatchQueue.global().asyncAfter(deadline: .now() + signInSeconds, execute: timeout)
-                }
-                lock.unlock()
-                completeIfReady()
-            case "error":
-                if object["code"] as? String == "persistence" {
-                    fail("This device's network identity could not be saved securely. The tunnel stopped; check Keychain access before reconnecting.")
-                    return
-                }
-                let detail = (object["error"] as? String) ?? ""
-                lock.lock()
-                let starting = startCompletion != nil
-                lock.unlock()
-                if starting {
-                    fail("The networking engine reported an error. Check your coordinator and enrollment status." + (detail.isEmpty ? "" : " (\(detail))"))
-                    return
-                }
-                // Once connected, the engine recovers from passing problems by
-                // itself, such as the coordinator out of reach for a moment, and
-                // its status shows the problem meanwhile. Stopping here would
-                // drop a working connection.
-                providerLog.error("engine problem: \(detail, privacy: .public)")
-                history.note("A problem the connection kept running through: " + detail)
-            default: break
+            } catch {
+                fail("The networking engine supplied invalid routes or DNS settings.")
+                return false
             }
+        case "status":
+            guard let status = object["status"] as? [String: Any], let backend = status["backendState"] as? String,
+                  status["ips"] is [String], status["peers"] is [[String: Any]] else {
+                fail("The networking engine supplied an invalid status.")
+                return false
+            }
+            lock.lock()
+            latestStatus = status
+            engineRunning = backend == "Running"
+            // Signing in through the browser takes longer than a normal start.
+            var signInNeeded = false
+            if backend == "NeedsLogin", (status["authURL"] as? String)?.isEmpty == false,
+               startCompletion != nil, !signInDeadlineSet {
+                signInDeadlineSet = true
+                signInNeeded = true
+                deadline?.cancel()
+                let timeout = DispatchWorkItem { [weak self] in self?.startupTimedOut(expected) }
+                deadline = timeout
+                DispatchQueue.global().asyncAfter(deadline: .now() + signInSeconds, execute: timeout)
+            }
+            lock.unlock()
+            if signInNeeded { connectForSignIn(expected) }
+            completeIfReady()
+        case "error":
+            if object["code"] as? String == "persistence" {
+                fail("This device's network identity could not be saved securely. The tunnel stopped; check Keychain access before reconnecting.")
+                return false
+            }
+            let detail = (object["error"] as? String) ?? ""
+            lock.lock()
+            let starting = startCompletion != nil
+            lock.unlock()
+            if starting {
+                fail("The networking engine reported an error. Check your coordinator and enrollment status." + (detail.isEmpty ? "" : " (\(detail))"))
+                return false
+            }
+            // Once connected, the engine recovers from passing problems by
+            // itself, such as the coordinator out of reach for a moment, and
+            // its status shows the problem meanwhile. Stopping here would
+            // drop a working connection.
+            providerLog.error("engine problem: \(detail, privacy: .public)")
+            history.note("A problem the connection kept running through: " + detail)
+        default: break
+        }
+        return true
+    }
+
+    /// The coordinator wants a sign-in in the browser. The start completes now,
+    /// with nothing routed through the tunnel, so the system counts the VPN as
+    /// connected: while a start is still pending, VPN On Demand holds back
+    /// other apps' traffic, Safari's too, so the sign-in page could not load,
+    /// and turning it off stopped the tunnel that was waiting for the sign-in.
+    /// The engine carries on once the sign-in is approved and sets the
+    /// network then. If Apple refuses the empty settings, the start keeps
+    /// waiting for the sign-in as before.
+    private func connectForSignIn(_ expected: Int64) {
+        lock.lock()
+        let applier = settingsApplier
+        lock.unlock()
+        applier?.submit(NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")) { [weak self] error in
+            guard let self, self.active(expected) else { return }
+            if let error {
+                providerLog.error("empty settings for the sign-in were refused: \(error.localizedDescription, privacy: .public)")
+                return
+            }
+            self.lock.lock()
+            let starting = self.startCompletion != nil
+            self.waitingForSignIn = starting
+            self.lock.unlock()
+            guard starting else { return }
+            self.history.note("Waiting for the sign-in in the browser; the connection is on meanwhile.")
+            self.finishStart(nil)
         }
     }
 
@@ -303,7 +351,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func finishStart(_ error: Error?) {
         lock.lock()
-        if error == nil && (stopRequested || !networkReady || !engineRunning || handle == 0) {
+        if error == nil && (stopRequested || handle == 0 || (!waitingForSignIn && (!networkReady || !engineRunning))) {
             lock.unlock()
             return
         }

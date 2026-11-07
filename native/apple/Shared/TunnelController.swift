@@ -38,6 +38,9 @@ final class TunnelController: ObservableObject {
     private var connectionGeneration: UInt64 = 0
     private var disconnectRequested = false
     private var failedStatusReplies = 0
+    private var changingOnDemand = false
+    /// Whether this connection already tried to turn on reconnecting by itself.
+    private var onDemandTried = false
     /// The warning the status checks last put in errorMessage, which they take
     /// away again once it no longer applies.
     private var statusWarning: String?
@@ -57,7 +60,7 @@ final class TunnelController: ObservableObject {
         if connected { return "Connected" }
         switch status {
         case .connecting: return authenticationURL == nil ? "Connecting" : "Sign in required"
-        case .connected: return "Starting network"
+        case .connected: return authenticationURL == nil ? "Starting network" : "Sign in required"
         case .reasserting: return "Reconnecting"
         case .disconnecting: return "Disconnecting"
         case .invalid, .disconnected: return "Disconnected"
@@ -135,8 +138,9 @@ final class TunnelController: ObservableObject {
             chosen.protocolConfiguration = tunnelProtocol
             chosen.localizedDescription = "Covee"
             chosen.isEnabled = true
-            // Reconnecting by itself is turned on once this start, the only one
-            // that carries an enrollment key, is under way.
+            // Reconnecting by itself stays off for this start, the only one that
+            // carries an enrollment key; it comes on once the connection runs
+            // (matchOnDemandToConnection).
             chosen.isOnDemandEnabled = false
             try await Self.save(chosen)
             try await Self.reload(chosen)
@@ -146,11 +150,38 @@ final class TunnelController: ObservableObject {
             if !key.isEmpty { options["authKey"] = key as NSString }
             try chosen.connection.startVPNTunnel(options: options)
             operationMessage = nil
-            await stayConnected(chosen)
             await refreshStatus()
         } catch {
             operationMessage = nil
             errorMessage = "Could not connect: \(error.localizedDescription)"
+        }
+    }
+
+    /// While VPN On Demand starts a tunnel, the system holds back other apps'
+    /// traffic until it connects, Safari's too, so the coordinator's sign-in
+    /// page could never load while reconnecting by itself is on and the
+    /// tunnel waits for that sign-in. It comes on once a connection runs and
+    /// is paused while the coordinator asks for a sign-in; the connection
+    /// that follows the sign-in turns it on again.
+    private func matchOnDemandToConnection() async {
+        guard !changingOnDemand, !disconnectRequested, let manager else { return }
+        let signingIn = authenticationURL != nil
+        guard signingIn ? manager.isOnDemandEnabled : (connected && !manager.isOnDemandEnabled && !onDemandTried) else { return }
+        changingOnDemand = true
+        defer { changingOnDemand = false }
+        if signingIn {
+            do {
+                try await Self.reload(manager)
+                guard manager.isOnDemandEnabled else { return }
+                manager.isOnDemandEnabled = false
+                try await Self.save(manager)
+            } catch {
+                errorMessage = "Covee could not pause reconnecting by itself for the sign-in: \(error.localizedDescription)"
+            }
+        } else {
+            // Once per connection, so a refused change is not retried every poll.
+            onDemandTried = true
+            await stayConnected(manager)
         }
     }
 
@@ -308,6 +339,7 @@ final class TunnelController: ObservableObject {
             connectionGeneration &+= 1
             providerStatus = .empty
             failedStatusReplies = 0
+            onDemandTried = false
             let previous = status
             status = currentStatus
             if currentStatus == .connected { disconnectRequested = false }
@@ -350,6 +382,7 @@ final class TunnelController: ObservableObject {
             providerStatus = try JSONDecoder().decode(ProviderStatus.self, from: response)
             failedStatusReplies = 0
             noteNetworks()
+            await matchOnDemandToConnection()
             if providerStatus.authURL != nil, authenticationURL == nil {
                 setStatusWarning("The coordinator returned a sign-in address outside its HTTPS origin. Check the coordinator’s public URL configuration.")
             } else {
@@ -403,11 +436,9 @@ final class TunnelController: ObservableObject {
                [.connecting, .connected, .reasserting, .disconnecting].contains(existing?.connection.status ?? .invalid) {
                 configuration = saved
             }
-            // A connection started by an earlier Covee, which did not reconnect by itself.
-            if let existing, existing.isEnabled, !existing.isOnDemandEnabled,
-               [.connecting, .connected, .reasserting].contains(existing.connection.status) {
-                await stayConnected(existing)
-            }
+            // A running connection without reconnecting by itself (one started
+            // by an earlier Covee, or from Settings) gets it from this status
+            // check, and one waiting for a sign-in has it paused.
             await refreshStatus()
         } catch {
             if !isBusy { errorMessage = "Could not read VPN settings: \(error.localizedDescription)" }
