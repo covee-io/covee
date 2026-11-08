@@ -251,8 +251,17 @@ func (s *session) questions(ctx context.Context) error {
 		n.DNS = record.DNS{Host: "route53", ZoneID: zone.ZoneID, Zone: zone.Zone}
 	}
 
-	// The console inside the network.
-	if s.n = n; s.consoleZoneOK() {
+	// The console inside the network. A restored network keeps what its
+	// backup has: the server refuses a certificate that does not cover it.
+	s.n = n
+	if n.RestoredFrom != nil {
+		if n.ConsoleInNetwork && !s.consoleZoneOK() {
+			return fmt.Errorf("the backup's console name console.%s is outside the DNS zone %s, so its certificate cannot be issued", n.DNSBaseDomain, n.DNS.Zone)
+		}
+		if n.HostsEnabled && !s.hostsZoneOK() {
+			return fmt.Errorf("the backup's hosts are named under %s, outside the DNS zone %s, so their certificate cannot be issued", n.DNSBaseDomain, n.DNS.Zone)
+		}
+	} else if s.consoleZoneOK() {
 		if n.ConsoleInNetwork, err = ask.Confirm("console_in_network", "Also open the admin console from your devices in the network, at https://console."+n.DNSBaseDomain+"? Devices outside the network cannot reach it", true); err != nil {
 			return err
 		}
@@ -389,6 +398,9 @@ func (s *session) questions(ctx context.Context) error {
 	s.say("  • A free Let's Encrypt certificate for %s", strings.Join(certNames(n), " and "))
 	if host := consoleHost(n); host != "" {
 		s.say("  • The admin console also opens at https://%s, for devices in the network only (a console device joins it)", host)
+	}
+	if n.HostsEnabled {
+		s.say("  • The backup's %d host(s) carry over for devices in the network, so the certificate covers every name under %s", len(n.Hosts), n.DNSBaseDomain)
 	}
 	if n.DNS.Dynamic {
 		s.say("  • The server checks the public address every 5 minutes and updates %s when it changes, using AWS IAM user %s, which may only change that record", n.Hostname, dns.UpdaterUser(n.Name))

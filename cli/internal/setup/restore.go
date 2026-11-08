@@ -2,6 +2,7 @@ package setup
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,8 +29,12 @@ type backupContents struct {
 	DNSBaseDomain string
 	Providers     []map[string]any
 	Grants        int
-	Secrets       map[string][]byte // identity-secrets/<name>
-	Files         int
+	// ConsoleInNetwork and HostsEnabled change what the certificate must cover.
+	ConsoleInNetwork bool
+	HostsEnabled     bool
+	Hosts            []record.Host
+	Secrets          map[string][]byte // identity-secrets/<name>
+	Files            int
 }
 
 // readBackup decrypts a backup on this computer and reads the network it holds.
@@ -46,7 +51,7 @@ func readBackup(path string, id *age.X25519Identity) (*backupContents, error) {
 	reader := tar.NewReader(plain)
 	out := &backupContents{Secrets: map[string][]byte{}}
 	haveDatabase := false
-	var metadata []byte
+	var metadata, hostsFile []byte
 	for {
 		h, err := reader.Next()
 		if errors.Is(err, io.EOF) {
@@ -62,6 +67,10 @@ func readBackup(path string, id *age.X25519Identity) (*backupContents, error) {
 		switch {
 		case h.Name == "deployment.json":
 			if metadata, err = io.ReadAll(io.LimitReader(reader, 1<<20)); err != nil {
+				return nil, err
+			}
+		case h.Name == serverHostsFile:
+			if hostsFile, err = io.ReadAll(io.LimitReader(reader, 1<<20)); err != nil {
 				return nil, err
 			}
 		case h.Name == "state/headscale/db.sqlite":
@@ -80,6 +89,8 @@ func readBackup(path string, id *age.X25519Identity) (*backupContents, error) {
 		Spec   struct {
 			ControlHost   string `json:"control_host"`
 			DNSBaseDomain string `json:"dns_base_domain"`
+			Console       bool   `json:"console_in_network"`
+			Hosts         bool   `json:"hosts"`
 			Identity      *struct {
 				Providers []map[string]any `json:"providers"`
 				Grants    []any            `json:"grants"`
@@ -100,6 +111,13 @@ func readBackup(path string, id *age.X25519Identity) (*backupContents, error) {
 	}
 	out.ControlHost, out.DNSBaseDomain = meta.Spec.ControlHost, meta.Spec.DNSBaseDomain
 	out.Providers, out.Grants = meta.Spec.Identity.Providers, len(meta.Spec.Identity.Grants)
+	out.ConsoleInNetwork, out.HostsEnabled = meta.Spec.Console, meta.Spec.Hosts
+	if out.HostsEnabled && len(bytes.TrimSpace(hostsFile)) > 0 {
+		var err error
+		if out.Hosts, err = hostsFromFile(hostsFile, out.DNSBaseDomain); err != nil {
+			return nil, fmt.Errorf("the backup's hosts: %w", err)
+		}
+	}
 	return out, nil
 }
 
@@ -128,6 +146,7 @@ func applyBackup(n *record.Network, c *backupContents) error {
 		return fmt.Errorf("the backup's hostname %q: %w", c.ControlHost, err)
 	}
 	n.Hostname, n.DNSBaseDomain = c.ControlHost, c.DNSBaseDomain
+	n.ConsoleInNetwork, n.HostsEnabled, n.Hosts = c.ConsoleInNetwork, c.HostsEnabled, c.Hosts
 	n.Providers, n.SignIn = nil, record.SignIn{}
 	for _, p := range c.Providers {
 		switch str(p, "id") {

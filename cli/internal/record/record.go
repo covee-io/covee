@@ -47,9 +47,14 @@ type Network struct {
 	ConsoleInNetwork bool `json:"console_in_network,omitempty"`
 	// Gateway runs the network's gateway device on the server; what goes
 	// through it is chosen on the console's Gateway page.
-	Gateway bool    `json:"gateway,omitempty"`
-	Server  Server  `json:"server"`
-	Secrets Secrets `json:"secrets"`
+	Gateway bool `json:"gateway,omitempty"`
+	// HostsEnabled runs the hosts device on the server: it serves Hosts,
+	// names under DNSBaseDomain that devices in the network open in a browser.
+	// The public certificate then covers every name under DNSBaseDomain.
+	HostsEnabled bool    `json:"hosts_enabled,omitempty"`
+	Hosts        []Host  `json:"hosts,omitempty"`
+	Server       Server  `json:"server"`
+	Secrets      Secrets `json:"secrets"`
 	// Providers lists the chosen sign-in methods: entra, google, apple.
 	Providers []string `json:"providers"`
 	SignIn    SignIn   `json:"sign_in"`
@@ -65,6 +70,20 @@ type Network struct {
 
 	// RestoredFrom is set when setup started from a backup instead of an empty network.
 	RestoredFrom *Restored `json:"restored_from,omitempty"`
+}
+
+// Host is one name the hosts device serves to devices in the network:
+// https://<Name>.<DNSBaseDomain> opens Scheme://<Device>:<Port><Path>.
+type Host struct {
+	// Name is one DNS label; the full name adds the network's DNSBaseDomain.
+	Name   string `json:"name"`
+	Device string `json:"device"`
+	Port   int    `json:"port"`
+	Path   string `json:"path,omitempty"`
+	// Scheme is "http" or "https" (empty means http).
+	Scheme string `json:"scheme,omitempty"`
+	// NoVerify accepts any certificate from an https device, such as a self-signed one.
+	NoVerify bool `json:"no_verify,omitempty"`
 }
 
 // Backup is one encrypted snapshot of the network's runtime.

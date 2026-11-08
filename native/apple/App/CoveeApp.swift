@@ -7,25 +7,30 @@ import ServiceManagement
 @main
 struct CoveeApp: App {
     @StateObject private var controller = TunnelController()
+    @StateObject private var navigation = ClientNavigation()
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #endif
 
     var body: some Scene {
         #if os(macOS)
-        WindowGroup(id: "main") {
-            ClientRootView(controller: controller)
+        // One window: opening Covee again brings it forward.
+        Window("Covee", id: "main") {
+            ClientRootView(controller: controller, navigation: navigation)
                 .frame(minWidth: 760, minHeight: 600)
         }
         .defaultSize(width: 900, height: 680)
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .appSettings) { SettingsCommand(navigation: navigation) }
+        }
         MenuBarExtra {
-            MenuStatusView(controller: controller)
+            MenuStatusView(controller: controller, navigation: navigation)
         } label: {
             // The Covee mark, full when connected and faded otherwise (template images follow the menu bar's colour).
             Image(controller.connected ? "MenuBarOn" : "MenuBarOff")
                 .renderingMode(.template)
                 .accessibilityLabel("Covee: \(controller.statusTitle)")
-        }
-        Settings {
-            ClientRootView(controller: controller, initialPage: .settings)
-                .frame(width: 720, height: 600)
         }
         WindowGroup("Terminal", id: "terminal", for: RemoteTarget.self) { $target in
             if let target {
@@ -35,16 +40,36 @@ struct CoveeApp: App {
         .defaultSize(width: 820, height: 520)
         #else
         WindowGroup {
-            ClientRootView(controller: controller)
+            ClientRootView(controller: controller, navigation: navigation)
         }
         #endif
     }
 }
 
 #if os(macOS)
+/// Covee keeps running in the menu bar after its window closes.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+}
+
+/// Settings… opens the Settings page of the one window.
+private struct SettingsCommand: View {
+    @ObservedObject var navigation: ClientNavigation
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Settings…") {
+            navigation.page = .settings
+            openWindow(id: "main")
+            NSApplication.shared.activate()
+        }.keyboardShortcut(",", modifiers: .command)
+    }
+}
+
 /// The menu under the Covee mark in the menu bar, like Tailscale's.
 private struct MenuStatusView: View {
     @ObservedObject var controller: TunnelController
+    @ObservedObject var navigation: ClientNavigation
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openURL) private var openURL
     @State private var startsAtLogin = SMAppService.mainApp.status == .enabled
@@ -78,6 +103,10 @@ private struct MenuStatusView: View {
                 }
             }.disabled(controller.isBusy)
         }
+        Button("Add network…") {
+            navigation.addingNetwork = true
+            show()
+        }.disabled(controller.isBusy)
         if let signIn = controller.authenticationURL {
             Button("Complete sign in…") { openURL(signIn) }
         }

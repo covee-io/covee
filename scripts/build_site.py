@@ -32,7 +32,7 @@ DESCRIPTION = ("Covee builds your own private network on a server you own: direc
 
 # The guide in reading order; each repository path → its published path.
 GUIDE = [f"docs/guide/{name}" for name in ("README.md", "introduction.md", "install.md", "server.md",
-                                            "devices.md", "gateway.md", "operations.md", "security.md")]
+                                            "devices.md", "gateway.md", "hosts.md", "operations.md", "security.md")]
 PAGES = {source: "docs/index.html" if source.endswith("README.md") else f"docs/{Path(source).stem}.html"
          for source in GUIDE}
 PAGES["website/privacy.md"] = "privacy.html"

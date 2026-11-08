@@ -93,15 +93,6 @@ final class TunnelController: ObservableObject {
         polling?.cancel()
     }
 
-    func saveSettings() {
-        do {
-            configuration = try configuration.validated()
-            try store.save(configuration)
-            errorMessage = nil
-            operationMessage = "Settings saved on this device."
-        } catch { errorMessage = error.localizedDescription }
-    }
-
     func connect(authKey: String) async {
         guard !isBusy, !active else { return }
         isBusy = true
@@ -226,6 +217,13 @@ final class TunnelController: ObservableObject {
 
     /// Connects to a saved network, leaving the current one first.
     func connect(to network: SavedNetworks.Network) async {
+        await connect(controlURL: network.controlURL, hostname: network.hostname, authKey: "")
+    }
+
+    /// Connects to a network by its address, leaving the current one first.
+    /// The caller has checked the address, name and key, so a mistake never
+    /// costs the running connection.
+    func connect(controlURL: String, hostname: String, authKey: String) async {
         guard !isBusy else { return }
         if active {
             await disconnect()
@@ -239,15 +237,28 @@ final class TunnelController: ObservableObject {
                 return
             }
         }
-        configuration.controlURL = network.controlURL
-        configuration.hostname = network.hostname
-        await connect(authKey: "")
+        configuration.controlURL = controlURL
+        configuration.hostname = hostname
+        await connect(authKey: authKey)
     }
 
     /// Removes a network from the list; connecting to its address adds it again.
     func forget(_ network: SavedNetworks.Network) {
         savedNetworks.forget(network)
         store.saveNetworks(savedNetworks)
+    }
+
+    /// The networks to show, including one that has not connected yet.
+    var listedNetworks: [SavedNetworks.Network] { savedNetworks.including(profileConfiguration ?? configuration) }
+
+    /// Changes the device name a network connects with, from its next connection.
+    func setHostname(_ hostname: String, for network: SavedNetworks.Network) throws {
+        try savedNetworks.setHostname(hostname, for: network)
+        store.saveNetworks(savedNetworks)
+        if configuration.controlURL == network.controlURL {
+            configuration.hostname = try ClientConfiguration(controlURL: network.controlURL, hostname: hostname).validated().hostname
+            try store.save(configuration)
+        }
     }
 
     /// Records the running network first in the list, with those the extension

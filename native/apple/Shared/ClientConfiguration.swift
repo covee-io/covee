@@ -139,6 +139,21 @@ struct SavedNetworks: Codable, Equatable {
         if forgotten.count > 32 { forgotten.removeFirst(forgotten.count - 32) }
     }
 
+    /// Changes the device name a saved network connects with.
+    mutating func setHostname(_ hostname: String, for network: Network) throws {
+        let checked = try ClientConfiguration(controlURL: network.controlURL, hostname: hostname).validated()
+        guard let index = networks.firstIndex(where: { $0.controlURL == checked.controlURL }) else { return }
+        networks[index].hostname = checked.hostname
+    }
+
+    /// The networks to list: these, after the one in use when it has not
+    /// connected yet, such as one waiting for its first sign-in.
+    func including(_ configuration: ClientConfiguration) -> [Network] {
+        guard let checked = try? configuration.validated(),
+              !networks.contains(where: { $0.controlURL == checked.controlURL }) else { return networks }
+        return [Network(controlURL: checked.controlURL, hostname: checked.hostname, suffix: nil)] + networks
+    }
+
     private static func suffix(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)).lowercased()
         return trimmed?.isEmpty == false ? trimmed : nil

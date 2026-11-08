@@ -103,6 +103,17 @@ func Status(ctx context.Context, env *Env, name string) error {
 	if n.Gateway {
 		s.say("  Gateway: device %s; choose what goes through it on the console's Gateway page", srv.containerState(ctx, "gateway"))
 	}
+	if n.HostsEnabled {
+		state := srv.containerState(ctx, "hosts-node")
+		if len(n.Hosts) == 0 {
+			s.say("  Hosts: none yet (hosts device %s); add one with `covee host add %s`", state, n.Name)
+		} else {
+			s.say("  Hosts: %d, for devices in the network (hosts device %s)", len(n.Hosts), state)
+			for _, h := range n.Hosts {
+				s.say("    %s → %s", hostURL(n, h), hostTarget(h))
+			}
+		}
+	}
 	if days, err := srv.certificateDays(ctx, n.Runtime); err == nil {
 		labels := map[string]string{"ingress-control": "Public certificate on the server", "headscale-internal": "Internal certificates", "internal-ca": "Internal CA"}
 		for _, name := range []string{"ingress-control", "headscale-internal", "internal-ca"} {

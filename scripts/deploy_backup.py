@@ -11,7 +11,8 @@ import subprocess
 import tarfile
 import threading
 
-from deploy import CONFIG_FILES, SECRET_FILES, ROOT, DeploymentError, identity_files, load_json, runtime_env, runtime_images
+from deploy import (CONFIG_FILES, HOSTS_CONFIG, HOSTS_NODE_STATE, HOSTS_TLS, SECRET_FILES, ROOT, DeploymentError, identity_files,
+                    load_json, runtime_env, runtime_images)
 
 MAX_MEMBER_BYTES = 1 << 30
 MAX_TOTAL_BYTES = 4 << 30
@@ -25,6 +26,7 @@ REQUIRED_FILES = (*CONFIG_FILES, "deployment.json", "runtime.env", *("secrets/" 
 REQUIRED_DIRS = ("secrets", "state", "state/headscale", "state/management")
 OPTIONAL_IDENTITY_FILES = {"identity.json", "identity-internal.crt", "identity-internal.key", "identity-trust.pem", "secrets/identity-signing-key",
                            "identity-secrets/entra-client-secret", "identity-secrets/google-client-secret", "identity-secrets/apple-private-key"}
+HOSTS_STATE = (HOSTS_NODE_STATE, HOSTS_CONFIG, HOSTS_TLS)
 
 
 def _contract(directory):
@@ -151,6 +153,8 @@ def _safe_name(name):
     allowed = allowed or name == "state/console-node" or name.startswith("state/console-node/")
     # The gateway device's identity (its settings are in state/management).
     allowed = allowed or name == "state/gateway" or name.startswith("state/gateway/")
+    # The hosts device's identity, the hosts and their records, and its copy of the public certificate.
+    allowed = allowed or any(name == state or name.startswith(state + "/") for state in HOSTS_STATE)
     if not allowed:
         raise BackupError("Archive member is outside the runtime file contract")
     return p
@@ -162,11 +166,11 @@ def _snapshot_paths(directory):
         raise BackupError("Backup requires a private runtime owned by its non-root operator")
     required_files, required_dirs = _contract(directory)
     names = list(required_files) + list(required_dirs)
-    for optional in ("state/identity", "state/console-node", "state/gateway"):
+    for optional in ("state/identity", "state/console-node", "state/gateway", *HOSTS_STATE):
         if (directory / optional).is_dir():
             names.append(optional)
     for root in (directory / "state/headscale", directory / "state/management", directory / "state/identity", directory / "state/console-node",
-                 directory / "state/gateway"):
+                 directory / "state/gateway", *(directory / state for state in HOSTS_STATE)):
         for current, dirs, files in os.walk(root, followlinks=False):
             # A leftover one-time join key is never backed up.
             names.extend(str((Path(current) / name).relative_to(directory)) for name in dirs + files if name != "join-key")
@@ -392,7 +396,8 @@ def _rebase(destination):
     images = {}
     expected_images = runtime_images(metadata)
     for line in (destination / "runtime.env").read_text().splitlines():
-        match = re.fullmatch(r"COVEE_(HEADSCALE|MANAGEMENT|INGRESS|IDENTITY)_IMAGE='([^']+)'", line)
+        # Every image the runtime uses, optional devices' too (COVEE_CONSOLE_NODE_IMAGE, COVEE_HOSTS_NODE_IMAGE).
+        match = re.fullmatch(r"COVEE_([A-Z_]+)_IMAGE='([^']+)'", line)
         if match:
             service, image = match.group(1).lower(), match.group(2)
             if service not in expected_images or service in images or image != expected_images[service] and not re.fullmatch(r"sha256:[a-f0-9]{64}", image):

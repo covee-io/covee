@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-11-08)
 
+- Covee for Mac and iPhone sign in through the browser while the VPN stays on. A network that asks for a sign-in no longer keeps its own sign-in page from loading, and the connection comes up once the sign-in finishes.
+- Covee for Mac has one window. **Open Covee** brings it forward instead of opening another, and Settings opens as a page in that window. Closing it leaves Covee in the menu bar.
+- Covee for Mac and iPhone list your networks on the Network page, with the one in use marked. Choose another to switch, even while connected. **Add network**, also in the Mac's menu bar, checks the address, device name and key before leaving the current network. Device names are set per network; the coordinator fields left Settings.
+- Hosts: give a service on any device its own address for devices in the network. `covee host add <network> grafana --to mac-mini:8080/some/sub/service` makes it open at `https://grafana.<mesh domain>`, with a valid certificate. Nothing new is reachable from the internet. See [Give your services their own addresses](docs/guide/hosts.md).
+- Restoring a backup of a network with a gateway or an in-network console works. It stopped with "Archive is missing runtime image references".
 - People appear by email and name. Sign-ins pass the person's email address and name from Microsoft, Google, Apple or a Covee account to the server, so the admin console and device lists show them instead of an account ID. Access still depends only on the account, never on the address. People who signed in before see the change after their next sign-in.
 - Updates and other server changes finish even when the connection to the server drops, as it does when you reach the server through the network's own gateway and the change restarts it. The command keeps running on the server, and the CLI connects again and carries on from where it left off.
 - The guide tells Windows users to turn on Tailscale's **Run unattended**, since Tailscale on Windows otherwise disconnects when you exit it from the taskbar.
@@ -14,7 +19,7 @@
   - On a Mac, Share screen opens macOS Screen Sharing; on iPhone and iPad the screen opens in Covee, with touch, zoom, scrolling and a keyboard with modifier keys.
   - The console's Access policy page has the rule for signing in to servers without keys.
   - Settings lists the open-source software Covee includes, with its licenses.
-- Covee for Mac and iPhone remember your networks. The Network page lists each network the device has connected to or has a saved sign-in for, so moving between them takes one tap instead of typing an address; **Switch network**, also in the Mac's menu bar, moves to another while connected.
+- Covee for Mac and iPhone remember your networks. The Network page lists each network the device has connected to or has a saved sign-in for, so moving between them takes one tap instead of typing an address.
 - The warning that the network status is unavailable no longer appears after one slow answer, and it goes away once the answers are back.
 - Signing in to the admin console works in Safari, including on iPhone and iPad, where it showed "Request origin is not allowed".
 

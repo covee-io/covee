@@ -106,8 +106,12 @@ func consoleHost(n *record.Network) string {
 	return "console." + n.DNSBaseDomain
 }
 
-// certNames are the names the public certificate covers.
+// certNames are the names the public certificate covers. With hosts on it
+// covers every name under the mesh domain, the console's included.
 func certNames(n *record.Network) []string {
+	if n.HostsEnabled {
+		return []string{n.Hostname, "*." + n.DNSBaseDomain}
+	}
 	if host := consoleHost(n); host != "" {
 		return []string{n.Hostname, host}
 	}
@@ -187,6 +191,9 @@ func deploymentConfig(n *record.Network, grants []map[string]any) ([]byte, error
 	}
 	if n.Gateway {
 		spec["gateway"] = true
+	}
+	if n.HostsEnabled {
+		spec["hosts"] = true
 	}
 	b, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {

@@ -57,6 +57,16 @@ Usage:
   covee gateway <network> [--off]
                                  let devices reach places only the server can, such as private
                                  cloud networks; choose what on the console's Gateway page
+  covee host add <network> <name> --to <device>:<port>[/path] [--https] [--no-verify]
+                                 let devices in the network open https://<name>.<mesh domain>,
+                                 which goes to a service on one of its devices, such as
+                                 --to mac-mini:8080; --https when the service itself uses https,
+                                 --no-verify too when its certificate is self-signed. The first
+                                 host adds a hosts device and renews the certificate
+  covee host list <network>      show the hosts and where each one goes
+  covee host remove <network> <name>
+                                 stop serving a host
+  covee host off <network>       remove every host and the hosts device
   covee update <network>         install this CLI's Covee files on a network and restart it
   covee cert renew <network>     renew the public and internal certificates (restarts once)
   covee dns auto <network> [--off]
@@ -232,6 +242,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 			return errors.New("usage: covee gateway <network> [--off]")
 		}
 		return setup.Gateway(ctx, env, fs.Arg(0), *off)
+	case "host", "hosts":
+		return host(ctx, env, rest)
 	case "update":
 		if len(rest) != 1 {
 			return errors.New("usage: covee update <network>")
@@ -296,7 +308,7 @@ func containsEq(a string) bool {
 
 func isBool(a string) bool {
 	switch a {
-	case "--staging", "-staging", "--no-devices", "-no-devices", "--reusable", "-reusable", "--ephemeral", "-ephemeral", "--devices", "-devices", "--off", "-off", "--in-network", "-in-network":
+	case "--staging", "-staging", "--no-devices", "-no-devices", "--reusable", "-reusable", "--ephemeral", "-ephemeral", "--devices", "-devices", "--off", "-off", "--in-network", "-in-network", "--https", "-https", "--no-verify", "-no-verify":
 		return true
 	}
 	return false
@@ -390,6 +402,50 @@ func users(ctx context.Context, env *setup.Env, args []string) error {
 			return err
 		}
 		return setup.UsersRemove(ctx, env, network, *email)
+	}
+	return errors.New(usage)
+}
+
+func host(ctx context.Context, env *setup.Env, args []string) error {
+	const (
+		addUsage = "usage: covee host add <network> <name> --to <device>:<port>[/path] [--https] [--no-verify]"
+		usage    = "usage: covee host add|list|remove|off <network> ..."
+	)
+	if len(args) < 2 {
+		return errors.New(usage)
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("host "+action, flag.ContinueOnError)
+	to := fs.String("to", "", "where the host goes: device:port, optionally with a path, such as mac-mini:8080/grafana")
+	https := fs.Bool("https", false, "the service on the device uses https")
+	noVerify := fs.Bool("no-verify", false, "with --https: accept the service's certificate even if it is self-signed")
+	if err := fs.Parse(reorder(args[1:])); err != nil {
+		return err
+	}
+	if action != "add" && (*to != "" || *https || *noVerify) {
+		return errors.New("--to, --https and --no-verify only go with `covee host add`")
+	}
+	switch action {
+	case "add":
+		if fs.NArg() != 2 || *to == "" {
+			return errors.New(addUsage + "\n  for example: covee host add home grafana --to mac-mini:8080")
+		}
+		return setup.HostAdd(ctx, env, fs.Arg(0), fs.Arg(1), *to, *https, *noVerify)
+	case "list":
+		if fs.NArg() != 1 {
+			return errors.New("usage: covee host list <network>")
+		}
+		return setup.HostList(env, fs.Arg(0))
+	case "remove":
+		if fs.NArg() != 2 {
+			return errors.New("usage: covee host remove <network> <name>")
+		}
+		return setup.HostRemove(ctx, env, fs.Arg(0), fs.Arg(1))
+	case "off":
+		if fs.NArg() != 1 {
+			return errors.New("usage: covee host off <network>")
+		}
+		return setup.HostsOff(ctx, env, fs.Arg(0))
 	}
 	return errors.New(usage)
 }

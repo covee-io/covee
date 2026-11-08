@@ -12,20 +12,27 @@ enum ClientPage: String, CaseIterable, Identifiable {
     }
 }
 
+/// What the app's window shows, so the menu bar and menus can change it.
+@MainActor final class ClientNavigation: ObservableObject {
+    @Published var page: ClientPage? = .network
+    @Published var addingNetwork = false
+}
+
 struct ClientRootView: View {
     @ObservedObject var controller: TunnelController
-    @State private var selection: ClientPage?
+    @ObservedObject var navigation: ClientNavigation
     @State private var enrollmentKey = ""
 
-    init(controller: TunnelController, initialPage: ClientPage = .network) {
-        self.controller = controller
-        _selection = State(initialValue: initialPage)
+    var body: some View {
+        pages.sheet(isPresented: $navigation.addingNetwork) {
+            NetworkSheet(controller: controller, editing: nil) { navigation.page = .network }
+        }
     }
 
-    var body: some View {
+    @ViewBuilder private var pages: some View {
         #if os(macOS)
         NavigationSplitView {
-            List(ClientPage.allCases, selection: $selection) { page in
+            List(ClientPage.allCases, selection: $navigation.page) { page in
                 Label(page.rawValue, systemImage: page.symbol).tag(page)
             }
             .navigationTitle("Covee")
@@ -38,10 +45,10 @@ struct ClientRootView: View {
                 }.padding()
             }
         } detail: {
-            page(selection ?? .network)
+            page(navigation.page ?? .network)
         }
         #else
-        TabView(selection: $selection) {
+        TabView(selection: $navigation.page) {
             ForEach(ClientPage.allCases) { item in
                 NavigationStack { page(item) }
                     .tabItem { Label(item.rawValue, systemImage: item.symbol) }
@@ -54,7 +61,7 @@ struct ClientRootView: View {
     @ViewBuilder private func page(_ page: ClientPage) -> some View {
         switch page {
         case .network:
-            NetworkView(controller: controller, enrollmentKey: $enrollmentKey)
+            NetworkView(controller: controller, navigation: navigation, enrollmentKey: $enrollmentKey)
         case .devices:
             #if os(macOS)
             NavigationStack { DevicesView(controller: controller) }
@@ -62,14 +69,18 @@ struct ClientRootView: View {
             DevicesView(controller: controller)
             #endif
         case .settings:
-            SettingsView(controller: controller, enrollmentKey: $enrollmentKey)
+            SettingsView(controller: controller)
         }
     }
 }
 
 private struct NetworkView: View {
     @ObservedObject var controller: TunnelController
+    @ObservedObject var navigation: ClientNavigation
     @Binding var enrollmentKey: String
+
+    /// The first network is entered right here; after that they are listed.
+    private var firstNetwork: Bool { !controller.active && controller.savedNetworks.networks.isEmpty }
 
     var body: some View {
         ScrollView {
@@ -87,18 +98,17 @@ private struct NetworkView: View {
                     }
                     Spacer(minLength: 0)
                 }
-                if !controller.active, !controller.savedNetworks.networks.isEmpty {
-                    SavedNetworksSection(controller: controller)
-                }
-                if !controller.active {
-                    ConfigurationFields(controller: controller, enrollmentKey: $enrollmentKey)
+                if firstNetwork {
+                    ConfigurationFields(address: $controller.configuration.controlURL, hostname: $controller.configuration.hostname, enrollmentKey: $enrollmentKey)
+                        .disabled(controller.isBusy)
+                } else {
+                    NetworksSection(controller: controller, navigation: navigation)
                 }
                 HStack {
                     if controller.active {
                         Button("Disconnect", systemImage: "stop.circle") { Task { await controller.disconnect() } }
                             .buttonStyle(.bordered).disabled(controller.isBusy)
-                        SwitchNetworkMenu(controller: controller)
-                    } else {
+                    } else if firstNetwork {
                         Button("Connect", systemImage: "arrow.right.circle") { startConnection() }
                             .buttonStyle(.borderedProminent).disabled(controller.isBusy)
                     }
@@ -143,9 +153,10 @@ private struct NetworkView: View {
     }
 
     private var statusDetail: String {
-        if controller.connected { return "Your encrypted network is ready." }
-        if controller.active { return "Waiting for the network extension and coordinator." }
-        return "Connect this device to your own coordinator."
+        let host = (controller.currentControlURL.flatMap { URLComponents(string: $0)?.host }) ?? "your coordinator"
+        if controller.connected { return "Your encrypted network on \(host) is ready." }
+        if controller.active { return "Waiting for the network extension and \(host)." }
+        return firstNetwork ? "Connect this device to your own coordinator." : "Choose a network to connect to."
     }
     private func startConnection() {
         let transientKey = enrollmentKey
@@ -154,61 +165,124 @@ private struct NetworkView: View {
     }
 }
 
-/// The networks this device has used, each one tap away.
-private struct SavedNetworksSection: View {
+/// Every network this device has used: the one in use, and each other one a
+/// tap away. Covee connects to one at a time.
+private struct NetworksSection: View {
     @ObservedObject var controller: TunnelController
+    @ObservedObject var navigation: ClientNavigation
+    @State private var editing: SavedNetworks.Network?
+
+    private func inUse(_ network: SavedNetworks.Network) -> Bool {
+        controller.active && network.controlURL == controller.currentControlURL
+    }
 
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 4) {
                 Label("Your networks", systemImage: "list.bullet").font(.headline).padding(.bottom, 6)
-                ForEach(controller.savedNetworks.networks) { network in
+                ForEach(controller.listedNetworks) { network in
                     Button { Task { await controller.connect(to: network) } } label: {
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(network.host).font(.body.weight(.semibold))
+                                Text(network.host).font(.body.weight(.semibold)).foregroundStyle(.primary)
                                 Text([network.suffix, "as " + network.hostname].compactMap { $0 }.joined(separator: " · "))
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 0)
-                            Image(systemName: "arrow.right.circle").foregroundStyle(Color.accentColor)
+                            if inUse(network) {
+                                Label(controller.statusTitle, systemImage: controller.connected ? "checkmark.circle.fill" : "clock")
+                                    .font(.caption).foregroundStyle(controller.connected ? Color.green : Color.secondary)
+                            } else {
+                                Image(systemName: "arrow.right.circle").foregroundStyle(Color.accentColor)
+                            }
                         }
                         .padding(.vertical, 6)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .disabled(controller.isBusy)
+                    .disabled(controller.isBusy || inUse(network))
                     .contextMenu {
-                        Button("Forget", systemImage: "trash", role: .destructive) { controller.forget(network) }
+                        if !inUse(network) {
+                            if controller.savedNetworks.networks.contains(network) {
+                                Button("Change device name", systemImage: "pencil") { editing = network }
+                            }
+                            Button("Forget", systemImage: "trash", role: .destructive) { controller.forget(network) }
+                        }
                     }
-                    .accessibilityLabel("Connect to \(network.host)")
+                    .accessibilityLabel(inUse(network) ? "\(network.host), \(controller.statusTitle)" : "Connect to \(network.host)")
                 }
+                Divider().padding(.vertical, 6)
+                Button("Add network", systemImage: "plus") { navigation.addingNetwork = true }
+                    .disabled(controller.isBusy)
                 #if os(macOS)
-                Text("Control-click a network to forget it.").font(.caption).foregroundStyle(.secondary)
+                Text("Covee connects to one network at a time. Control-click a network to change this device's name on it, or to forget it.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.top, 6)
                 #else
-                Text("Touch and hold a network to forget it.").font(.caption).foregroundStyle(.secondary)
+                Text("Covee connects to one network at a time. Touch and hold a network to change this device's name on it, or to forget it.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.top, 6)
                 #endif
             }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
+        }
+        .sheet(item: $editing) { network in
+            NetworkSheet(controller: controller, editing: network) {}
         }
     }
 }
 
-/// Leaves this network for another the device has used.
-private struct SwitchNetworkMenu: View {
+/// Adds a network and connects to it, leaving the current one only once the
+/// details are right. With editing, changes the device name of a saved network.
+private struct NetworkSheet: View {
     @ObservedObject var controller: TunnelController
+    let editing: SavedNetworks.Network?
+    let done: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var address = ""
+    @State private var hostname = ""
+    @State private var enrollmentKey = ""
+    @State private var problem: String?
 
     var body: some View {
-        let others = controller.savedNetworks.networks.filter { $0.controlURL != controller.currentControlURL }
-        if !others.isEmpty {
-            Menu {
-                ForEach(others) { network in
-                    Button(network.host) { Task { await controller.connect(to: network) } }
-                }
-            } label: {
-                Label("Switch network", systemImage: "arrow.left.arrow.right")
+        VStack(alignment: .leading, spacing: 20) {
+            Text(editing == nil ? "Add a network" : "Change device name").font(.title2.bold())
+            if let editing {
+                Text("How this device appears on \(editing.host), from the next time it connects.").foregroundStyle(.secondary)
+                ConfigurationFields(hostname: $hostname)
+            } else {
+                Text(controller.active ? "Covee leaves the network it's on and connects to this one." : "Enter the address your network's admin gave you.")
+                    .foregroundStyle(.secondary)
+                ConfigurationFields(address: $address, hostname: $hostname, enrollmentKey: $enrollmentKey)
             }
-            .disabled(controller.isBusy)
+            if let problem {
+                Text(problem).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(editing == nil ? "Connect" : "Save") { submit() }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+            }.controlSize(.large)
         }
+        .padding(24)
+        #if os(macOS)
+        .frame(width: 480)
+        #endif
+        .onAppear {
+            hostname = editing?.hostname ?? controller.configuration.hostname
+        }
+    }
+
+    private func submit() {
+        do {
+            if let editing {
+                try controller.setHostname(hostname, for: editing)
+            } else {
+                let checked = try ClientConfiguration(controlURL: address, hostname: hostname).validated()
+                let key = try EnrollmentKey.validated(enrollmentKey)
+                Task { await controller.connect(controlURL: checked.controlURL, hostname: checked.hostname, authKey: key) }
+            }
+            done()
+            dismiss()
+        } catch { problem = error.localizedDescription }
     }
 }
 
@@ -274,26 +348,29 @@ private struct ExitNodeSection: View {
 }
 
 private struct ConfigurationFields: View {
-    @ObservedObject var controller: TunnelController
-    @Binding var enrollmentKey: String
+    var address: Binding<String>? = nil
+    let hostname: Binding<String>
+    var enrollmentKey: Binding<String>? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Coordinator").font(.headline)
-                TextField("https://network.example.com", text: $controller.configuration.controlURL)
-                    .textContentType(.URL)
-                    .autocorrectionDisabled()
-                    #if os(iOS)
-                    .textInputAutocapitalization(.never).keyboardType(.URL)
-                    #endif
-                    .textFieldStyle(.roundedBorder)
-                    .frame(minHeight: 44)
-                    .accessibilityLabel("Coordinator HTTPS address")
+            if let address {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Coordinator").font(.headline)
+                    TextField("https://network.example.com", text: address)
+                        .textContentType(.URL)
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never).keyboardType(.URL)
+                        #endif
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minHeight: 44)
+                        .accessibilityLabel("Coordinator HTTPS address")
+                }
             }
             VStack(alignment: .leading, spacing: 6) {
                 Text("Device name").font(.headline)
-                TextField("my-device", text: $controller.configuration.hostname)
+                TextField("my-device", text: hostname)
                     .autocorrectionDisabled()
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
@@ -302,41 +379,36 @@ private struct ConfigurationFields: View {
                     .frame(minHeight: 44)
                     .accessibilityLabel("Device name")
             }
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Enrollment key").font(.headline)
-                SecureField("Optional for a device already enrolled", text: $enrollmentKey)
-                    .autocorrectionDisabled()
-                    #if os(iOS)
-                    .textInputAutocapitalization(.never)
-                    #endif
-                    .textFieldStyle(.roundedBorder)
-                    .frame(minHeight: 44)
-                    .accessibilityLabel("Optional enrollment key")
-                Text("Passed to the extension for this connection, then cleared from this form.")
-                    .font(.caption).foregroundStyle(.secondary)
+            if let enrollmentKey {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Enrollment key").font(.headline)
+                    SecureField("Optional for a device already enrolled", text: enrollmentKey)
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minHeight: 44)
+                        .accessibilityLabel("Optional enrollment key")
+                    Text("Passed to the extension for this connection, then cleared from this form.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
-        }.disabled(controller.active || controller.isBusy)
+        }
     }
 }
 
 private struct SettingsView: View {
     @ObservedObject var controller: TunnelController
-    @Binding var enrollmentKey: String
     @State private var showsAcknowledgements = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                Text("Your network, your coordinator.").font(.title2.bold())
-                ConfigurationFields(controller: controller, enrollmentKey: $enrollmentKey)
-                Button("Save settings") { controller.saveSettings() }
-                    .buttonStyle(.bordered).controlSize(.large).disabled(controller.active || controller.isBusy)
-                if controller.active { Text("Disconnect before changing coordinator or device name.").font(.callout).foregroundStyle(.secondary) }
                 OperationFeedback(controller: controller)
-                Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Connection settings", systemImage: "lock.shield").font(.headline)
-                    Text("Only the coordinator address and device name are saved here. The network extension keeps this device’s network identity in its own Keychain.")
+                    Text("Add networks and change this device's name on the Network page. Only coordinator addresses and device names are saved here. The network extension keeps this device’s network identity in its own Keychain.")
                         .foregroundStyle(.secondary)
                     Toggle("Use the network’s gateway", isOn: Binding(get: { controller.usesGatewayRoutes }, set: { accept in
                         Task { await controller.setAcceptRoutes(accept) }

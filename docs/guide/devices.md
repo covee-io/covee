@@ -9,7 +9,7 @@ Every device needs the network's address, such as `https://covee.example.com`, a
 3. The first time, macOS asks you to allow Covee's network extension, in System Settings → General → Login Items & Extensions → Network Extensions, and to add a VPN configuration. Allow both.
 4. Covee shows **Complete sign in**. Click **Open coordinator sign in**, sign in on the network's page in your browser, and return to Covee: the Mac is connected.
 
-Covee remembers each network it connects to. To move to another, choose **Switch network** on the Network page or in the menu bar; while disconnected, pick one under **Your networks**. A network you have used before needs no new sign-in.
+Covee remembers each network it connects to, and connects to one at a time. To move to another, click it under **Your networks** on the Network page, or choose **Switch network** in the menu bar. To join a new one, click **Add network**, on the Network page or in the menu bar. A network you have used before needs no new sign-in. Control-click a network to change this device's name on it, or to forget it.
 
 Covee also lives in the menu bar. From there you can disconnect, see the other devices and copy their addresses, choose an exit node, and turn the network gateway's routes on or off (**Use the network's gateway**). Closing or quitting Covee leaves the Mac connected, and if the connection stops for any other reason, it starts again by itself; choose **Disconnect** to leave the network. Requires macOS 15 or later on Apple silicon.
 

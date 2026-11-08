@@ -21,7 +21,7 @@ import stat
 import subprocess
 import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import unquote_to_bytes, urlsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +50,29 @@ GATEWAY_STATE = "state/gateway"
 # The management service keeps the console's gateway settings here: the gateway
 # reads routes.json, and apply-gateway-dns applies dns.json.
 GATEWAY_CONFIG = "state/management/gateway"
+# Network-only hosts: names such as grafana.<mesh domain> that the hosts device
+# serves to devices in the network, passing each to a device's port (spec field hosts).
+HOSTS_COMPOSE = ROOT / "deploy/compose.hosts.yaml"
+HOSTS_NODE_IMAGE = "covee-hosts-node:portable-local"
+HOSTS_TAG = "tag:covee-hosts"
+HOSTS_DEVICE = "hosts"
+# The device identity, like the console node's (covee-joined, join-key).
+HOSTS_NODE_STATE = "state/hosts-node"
+# hosts.json for the hosts device and extra-records.json for the coordinator,
+# both read from /etc/covee-hosts.
+HOSTS_CONFIG = "state/hosts"
+HOSTS_FILE = "hosts.json"
+HOSTS_RECORDS_FILE = "extra-records.json"
+HOSTS_RECORDS_PATH = "/etc/covee-hosts/extra-records.json"
+# The hosts device's copy of the public certificate (fullchain.pem, privkey.pem).
+HOSTS_TLS = "state/hosts-tls"
+HOSTS_RESERVED = ("hosts", "console", "gateway", "admin")
+HOSTS_MAX = 256
+HOSTS_PATH_MAX = 1024
+# The hosts device refuses a target outside the network's own ranges (prepare() assigns them).
+HOSTS_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+# A name the certificate covers only through *.<mesh domain>.
+HOSTS_CHECK = "covee-hosts-check."
 IDENTITY_CONFIG_FILES = ("identity.json", "identity-internal.crt", "identity-internal.key", "identity-trust.pem")
 # Local Covee accounts (passkeys, passwords) live in this broker-owned state file.
 LOCAL_ACCOUNTS_FILE = "/var/lib/covee-identity/accounts.json"
@@ -267,12 +290,18 @@ def validate_dns(dns, spec):
 def dns_config(spec):
     """The only source of the coordinator's dns block, shared by preparation and drift detection."""
     custom = spec.get("dns") or {}
-    return {"magic_dns": True, "base_domain": spec["dns_base_domain"],
-            "override_local_dns": bool(custom.get("override_local_dns", False)),
-            "nameservers": {"global": list(custom.get("nameservers", [])),
-                            "split": {domain: list(resolvers) for domain, resolvers in custom.get("split", {}).items()}},
-            "search_domains": list(custom.get("search_domains", [])),
-            "extra_records": [dict(record) for record in custom.get("extra_records", [])]}
+    config = {"magic_dns": True, "base_domain": spec["dns_base_domain"],
+              "override_local_dns": bool(custom.get("override_local_dns", False)),
+              "nameservers": {"global": list(custom.get("nameservers", [])),
+                              "split": {domain: list(resolvers) for domain, resolvers in custom.get("split", {}).items()}},
+              "search_domains": list(custom.get("search_domains", []))}
+    if spec.get("hosts"):
+        # Headscale refuses both keys together. The file holds the custom records
+        # as well as the hosts' names, and changes to it apply without a restart.
+        config["extra_records_path"] = HOSTS_RECORDS_PATH
+    else:
+        config["extra_records"] = [dict(record) for record in custom.get("extra_records", [])]
+    return config
 
 
 def validate_identity(identity):
@@ -339,6 +368,8 @@ def runtime_images(metadata):
         images["console_node"] = CONSOLE_NODE_IMAGE
     if metadata["spec"].get("gateway"):
         images["gateway"] = GATEWAY_IMAGE
+    if metadata["spec"].get("hosts"):
+        images["hosts_node"] = HOSTS_NODE_IMAGE
     return images
 
 
@@ -353,7 +384,7 @@ def identity_files(metadata):
 def validate_spec(raw, *, lab=False):
     allowed = {"control_host", "admin_host", "public_bind", "public_port", "admin_port", "stun_port",
                "dns_base_domain", "node_expiry", "allowed_group_ids", "oidc", "tls", "identity", "dns", "console_in_network",
-               "gateway"}
+               "gateway", "hosts"}
     if not isinstance(raw, dict) or set(raw) - allowed:
         raise DeploymentError("Deployment JSON contains unknown fields")
     spec = {"admin_host": "localhost", "public_bind": "0.0.0.0", "public_port": 443,
@@ -390,6 +421,13 @@ def validate_spec(raw, *, lab=False):
                 raise DeploymentError("The in-network console needs its own name")
     if "gateway" in spec and type(spec["gateway"]) is not bool:
         raise DeploymentError("gateway must be true or false")
+    if "hosts" in spec:
+        if type(spec["hosts"]) is not bool:
+            raise DeploymentError("hosts must be true or false")
+        if spec["hosts"] and lab:
+            raise DeploymentError("Network-only hosts need a production runtime with a public certificate")
+        if spec["hosts"] and "identity" not in spec:
+            raise DeploymentError("Network-only hosts need the identity broker profile")
     if "dns" in spec:
         custom = validate_dns(spec["dns"], spec)
         if custom:
@@ -633,6 +671,225 @@ def with_node_attribute(policy_text, attribute):
     return json.dumps(policy, indent=2) + "\n"
 
 
+def hosts_member_grant():
+    # 80 only redirects to https.
+    return {"src": ["autogroup:member"], "dst": [HOSTS_TAG], "ip": ["tcp:443", "tcp:80"]}
+
+
+def hosts_grants(entries):
+    """One grant per distinct device address and port the hosts device passes requests to."""
+    targets = {}
+    for entry in entries:
+        address = ipaddress.ip_address(entry["address"])
+        targets[(str(address) + ("/32" if address.version == 4 else "/128"), entry["port"])] = None
+    return [{"src": [HOSTS_TAG], "dst": [dst], "ip": [f"tcp:{port}"]} for dst, port in targets]
+
+
+def is_hosts_grant(grant):
+    """Every grant whose only source is the hosts device belongs to Covee hosts."""
+    return isinstance(grant, dict) and grant.get("src") == [HOSTS_TAG]
+
+
+def hosts_policy(policy_text):
+    try:
+        policy = json.loads(strip_hujson(policy_text))
+    except ValueError as error:
+        raise DeploymentError("The persisted policy could not be read; fix it in the console's policy editor") from error
+    if not isinstance(policy, dict) or not isinstance(policy.setdefault("tagOwners", {}), dict) or not isinstance(policy.setdefault("grants", []), list):
+        raise DeploymentError("The persisted policy has unexpected tagOwners or grants")
+    return policy
+
+
+def with_hosts_access(policy_text, entries):
+    """The policy with the hosts device's tag owner, members' access to it and
+    exactly the grants for the given hosts, or None if it has them already.
+
+    Members may reach only TCP 443 and 80 of the hosts device, and the hosts
+    device only each host's device and port; earlier host grants are replaced."""
+    policy = hosts_policy(policy_text)
+    original = json.loads(json.dumps(policy))
+    policy["tagOwners"].setdefault(HOSTS_TAG, [])
+    grants = [grant for grant in policy["grants"] if not is_hosts_grant(grant)]
+    if hosts_member_grant() not in grants:
+        grants.append(hosts_member_grant())
+    policy["grants"] = grants + hosts_grants(entries)
+    return None if policy == original else json.dumps(policy, indent=2) + "\n"
+
+
+def without_hosts_access(policy_text):
+    """The policy without members' access to the hosts device or its grants, or None if it has neither."""
+    policy = hosts_policy(policy_text)
+    grants = [grant for grant in policy["grants"] if not is_hosts_grant(grant) and grant != hosts_member_grant()]
+    if grants == policy["grants"]:
+        return None
+    policy["grants"] = grants
+    return json.dumps(policy, indent=2) + "\n"
+
+
+def node_name(node):
+    return node.get("given_name") or node.get("givenName") or ""
+
+
+def node_tags(node):
+    return [*(node.get("tags") or []), *(node.get("forced_tags") or []), *(node.get("valid_tags") or [])]
+
+
+def node_addresses(node):
+    """A device's addresses in the network, IPv4 first."""
+    addresses = []
+    for value in node.get("ip_addresses") or node.get("ipAddresses") or []:
+        try:
+            addresses.append(ipaddress.ip_address(value))
+        except (ValueError, TypeError):
+            continue
+    return [str(address) for address in sorted(addresses, key=lambda address: address.version)]
+
+
+def find_hosts_node(nodes):
+    """The hosts device among the coordinator's devices, or None before it has joined."""
+    tagged = [node for node in nodes if HOSTS_TAG in node_tags(node)]
+    named = [node for node in tagged if node_name(node) == HOSTS_DEVICE]
+    return (named or tagged or [None])[0]
+
+
+def valid_host_path(path):
+    """The hosts device's own rules for a path (checkPath in deploy/hosts-node/hosts.go),
+    plus no leading //. It keeps serving its previous hosts if one entry breaks
+    them, so a path it would refuse must never get as far as hosts.json."""
+    if path == "":
+        return True
+    try:
+        size = len(path.encode())
+    except UnicodeEncodeError:
+        return False
+    if not path.startswith("/") or path.startswith("//") or size > HOSTS_PATH_MAX or re.search(r"%(?![0-9A-Fa-f]{2})", path):
+        return False
+    plain = unquote_to_bytes(path)
+    if ".." in path or b".." in plain or any(ord(ch) <= 32 or ord(ch) == 127 or ch in "?#\\" for ch in path):
+        return False
+    return not any(byte < 32 or byte == 127 or byte == ord("\\") for byte in plain)
+
+
+def validate_hosts(raw, spec):
+    """The requested hosts from set-hosts input, checked before the network's devices are.
+
+    raw is the complete intended list: {"hosts": [{"name", "device", "port",
+    "path", "scheme", "verify"}]}, where name is one DNS label under the mesh domain."""
+    if not isinstance(raw, dict) or set(raw) != {"hosts"} or not isinstance(raw["hosts"], list):
+        raise DeploymentError('The hosts must be given as {"hosts": [...]}')
+    if len(raw["hosts"]) > HOSTS_MAX:
+        raise DeploymentError(f"A network can have at most {HOSTS_MAX} hosts")
+    base = spec["dns_base_domain"]
+    records = {record["name"] for record in (spec.get("dns") or {}).get("extra_records", [])}
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    hosts, seen = [], set()
+    for host in raw["hosts"]:
+        if not isinstance(host, dict) or not {"name", "device", "port"} <= set(host) or set(host) - {"name", "device", "port", "path", "scheme", "verify"}:
+            raise DeploymentError("Each host needs a name, a device and a port, and may have a path, a scheme and verify")
+        name, device, port = host["name"], host["device"], host["port"]
+        if not isinstance(name, str) or not re.fullmatch(label, name):
+            raise DeploymentError("A host's name must be one word of lowercase letters, digits and hyphens, such as grafana, without a dot")
+        if name in HOSTS_RESERVED:
+            raise DeploymentError(f"{name} is a name Covee uses itself; choose another name")
+        full = name + "." + base
+        if len(full) > 253:
+            raise DeploymentError(f"{full} is too long for a DNS name")
+        if full in (spec["control_host"], spec["admin_host"]) or full in records:
+            raise DeploymentError(f"{full} is already used in this network's DNS settings; choose another name")
+        if name in seen:
+            raise DeploymentError(f"There are two hosts named {name}")
+        seen.add(name)
+        if not isinstance(device, str) or not re.fullmatch(label, device):
+            raise DeploymentError("A host's device must be a device name in this network, such as mac-mini")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise DeploymentError(f"The port of {name} must be a number from 1 to 65535")
+        path = host.get("path", "")
+        if not isinstance(path, str) or not valid_host_path(path):
+            raise DeploymentError(f"The path of {name} must start with one / and have no spaces, '..', '?', '#' or backslashes, "
+                                  f"be at most {HOSTS_PATH_MAX} characters, and use % only for escapes such as %20")
+        scheme = host.get("scheme", "http")
+        if scheme not in ("http", "https"):
+            raise DeploymentError(f"The scheme of {name} must be http or https")
+        verify = host.get("verify", True)
+        if type(verify) is not bool:
+            raise DeploymentError(f"verify of {name} must be true or false")
+        hosts.append({"name": name, "device": device, "port": port, "path": path, "scheme": scheme, "verify": verify})
+    return hosts
+
+
+def node_identifier(node):
+    return str(node.get("id", ""))
+
+
+def target_addresses(node):
+    """Where the hosts device may send requests for this device, IPv4 first."""
+    return [address for address in node_addresses(node) if any(ipaddress.ip_address(address) in network for network in HOSTS_NETWORKS)]
+
+
+def replaced_device_message(device, label):
+    return f"The device {device} is not the same device as when host {label} was added. Remove the host and add it again if this is the right device."
+
+
+def resolve_hosts(hosts, nodes, spec, existing=()):
+    """hosts.json entries for checked hosts, each pinned to its device's identifier
+    and address, and warnings for the person changing them.
+
+    existing is what hosts.json holds now. A name another device has taken is
+    refused only for a new host; an existing one gets a warning. Taking hosts
+    away always works: the hosts that stay are kept as they are, with a warning,
+    whatever has happened to their devices, or two hosts whose devices were
+    replaced could never be removed, since each list would still name the other."""
+    base = spec["dns_base_domain"]
+    current = {entry["name"]: entry for entry in existing}
+    devices = {node_name(node): node for node in nodes if HOSTS_TAG not in node_tags(node)}
+    names = {node_name(node) for node in nodes}
+
+    def unchanged(host):
+        entry = current.get(host["name"] + "." + base)
+        return entry is not None and all(entry.get(key) == host[key] for key in ("device", "port", "path", "scheme", "verify"))
+
+    removing = len(hosts) < len(current) and all(unchanged(host) for host in hosts)
+    entries, warnings = [], []
+    for host in hosts:
+        label, device, full = host["name"], host["device"], host["name"] + "." + base
+        old = current.get(full)
+        if label in names:
+            if old is None:
+                raise DeploymentError(f"{label} is already the name of a device in this network; choose another name")
+            warnings.append(f"The device {label} and the host {full} have the same name, so that name can mean either one. Rename the host: remove it and add it again under another name.")
+        node = devices.get(device)
+        pinned = old.get("node_id") if old and old.get("device") == device else None
+        problem = None
+        if node is None:
+            problem = "A host cannot point at the hosts device itself" if device in names else f"No device named {device} in this network"
+        elif pinned and node_identifier(node) != pinned:
+            problem = replaced_device_message(device, label)
+        elif not target_addresses(node):
+            problem = f"{device} has no address in this network yet"
+        if problem:
+            if not removing:
+                raise DeploymentError(problem)
+            warnings.append(problem)
+            entries.append(old)
+            continue
+        entries.append({"name": full, "address": target_addresses(node)[0], "port": host["port"], "path": host["path"],
+                        "scheme": host["scheme"], "verify": host["verify"], "device": device, "node_id": node_identifier(node)})
+    return entries, warnings
+
+
+def host_target(entry):
+    return f"{entry['scheme']}://{entry['device']}:{entry['port']}{entry['path']}"
+
+
+def host_records(entries, addresses):
+    """An A (and AAAA) record per host, pointing at the hosts device."""
+    records = []
+    for entry in entries:
+        for address in addresses:
+            records.append({"name": entry["name"], "type": "A" if ipaddress.ip_address(address).version == 4 else "AAAA", "value": address})
+    return records
+
+
 def move_accounts(database, old_issuer, new_issuer):
     """File the coordinator's sign-in accounts under a new issuer; returns how many moved.
 
@@ -722,6 +979,99 @@ def create_gateway_dirs(directory):
             path.mkdir(mode=0o700)
 
 
+def create_hosts_dirs(directory):
+    """Returns the folders it created, so a failed change can remove them."""
+    created = []
+    for name in (HOSTS_NODE_STATE, HOSTS_CONFIG, HOSTS_TLS):
+        path = directory / name
+        if not path.exists():
+            path.mkdir(mode=0o700)
+            created.append(path)
+    return created
+
+
+def check_hosts_dirs(directory):
+    for name in (HOSTS_NODE_STATE, HOSTS_CONFIG, HOSTS_TLS):
+        path = directory / name
+        if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+            raise DeploymentError("The hosts device's folders must be private directories owned by the service account")
+
+
+def read_hosts(directory):
+    """The hosts the hosts device serves (hosts.json entries); none when the file is missing."""
+    path = directory / HOSTS_CONFIG / HOSTS_FILE
+    if not path.exists():
+        return []
+    hosts = load_json(path)
+    try:
+        if not isinstance(hosts, dict) or not isinstance(hosts.get("hosts"), list):
+            raise ValueError("not a list")
+        for entry in hosts["hosts"]:
+            ipaddress.ip_address(entry["address"])
+            if not isinstance(entry["name"], str) or type(entry["port"]) is not int:
+                raise ValueError("invalid host")
+    except (ValueError, TypeError, KeyError) as error:
+        raise DeploymentError("The hosts file is not a list of hosts") from error
+    return hosts["hosts"]
+
+
+def write_hosts(directory, entries):
+    """Returns whether the file changed. The hosts device reads it again when it changes."""
+    path, data = directory / HOSTS_CONFIG / HOSTS_FILE, json.dumps({"hosts": entries}, indent=2) + "\n"
+    if path.is_file() and path.read_text() == data:
+        return False
+    replace_private(path, data, mode=0o600)
+    return True
+
+
+def read_hosts_records(directory):
+    path = directory / HOSTS_CONFIG / HOSTS_RECORDS_FILE
+    records = load_json(path) if path.exists() else []
+    if not isinstance(records, list) or any(not isinstance(r, dict) or set(r) != {"name", "type", "value"} for r in records):
+        raise DeploymentError("The hosts' DNS records file is not a list of records")
+    return records
+
+
+def write_hosts_records(directory, spec, addresses=None):
+    """Write the coordinator's extra records file: the custom records, then the
+    hosts' names pointing at the hosts device. Returns whether it changed.
+
+    The coordinator reloads the file when it changes. addresses are the hosts
+    device's, known once it has joined; None keeps those already in the file."""
+    entries = read_hosts(directory)
+    if addresses is None:
+        names = {entry.get("name") for entry in entries}
+        addresses = list(dict.fromkeys(r["value"] for r in read_hosts_records(directory) if r["name"] in names))
+    records = [dict(record) for record in (spec.get("dns") or {}).get("extra_records", [])] + host_records(entries, addresses)
+    path, data = directory / HOSTS_CONFIG / HOSTS_RECORDS_FILE, json.dumps(records, indent=2) + "\n"
+    if path.is_file() and path.read_text() == data:
+        return False
+    replace_private(path, data, mode=0o600)
+    return True
+
+
+def copy_hosts_certificate(directory):
+    """The hosts device serves the public certificate from its own copy, and
+    reloads it when it changes. The key goes first and the certificate last, so
+    once the certificate has changed both files are new. Returns whether anything changed."""
+    changed = False
+    for source, target in (("ingress-control.key", "privkey.pem"), ("ingress-control.crt", "fullchain.pem")):
+        data, path = (directory / source).read_bytes(), directory / HOSTS_TLS / target
+        if not path.is_file() or path.read_bytes() != data:
+            replace_private(path, data, mode=0o600)
+            changed = True
+    return changed
+
+
+def ensure_hosts_files(directory, spec):
+    """The coordinator needs the records file before it starts, and the hosts device its files."""
+    check_hosts_dirs(directory)
+    if not (directory / HOSTS_CONFIG / HOSTS_FILE).exists():
+        write_hosts(directory, [])
+    write_hosts_records(directory, spec)
+    copy_hosts_certificate(directory)
+
+
 def prepare(directory, raw, *, lab=False):
     spec = validate_spec(raw, lab=lab)
     if os.getuid() == 0:
@@ -749,10 +1099,15 @@ def prepare(directory, raw, *, lab=False):
         cert_pair(directory / "ingress-control.crt", directory / "ingress-control.key", spec["control_host"])
         if console_host(spec) and not cert_covers(directory / "ingress-control.crt", console_host(spec)):
             raise DeploymentError("The public certificate must also name the in-network console host")
+        if spec.get("hosts") and not cert_covers(directory / "ingress-control.crt", HOSTS_CHECK + spec["dns_base_domain"]):
+            raise DeploymentError(f"The public certificate must also cover every name under {spec['dns_base_domain']} (*.{spec['dns_base_domain']})")
     if console_host(spec):
         (directory / CONSOLE_NODE_STATE).mkdir(mode=0o700)
     if spec.get("gateway"):
         create_gateway_dirs(directory)
+    if spec.get("hosts"):
+        create_hosts_dirs(directory)
+        ensure_hosts_files(directory, spec)
     if spec["tls"].get("admin_cert_file"):
         for field, target in (("admin_cert_file", "ingress-admin.crt"), ("admin_key_file", "ingress-admin.key")):
             write_private(directory / target, read_source(spec["tls"][field], private=field.endswith("key_file")))
@@ -958,6 +1313,18 @@ def validate(directory, *, production=False):
             path = directory / name
             if path.is_symlink() or not path.is_dir() or path.stat().st_uid != metadata["uid"] or path.stat().st_mode & 0o077:
                 raise DeploymentError("The gateway's folders must be private and owned by the service account")
+    if spec.get("hosts"):
+        check_hosts_dirs(directory)
+        for name in (HOSTS_FILE, HOSTS_RECORDS_FILE):
+            path = directory / HOSTS_CONFIG / name
+            if path.is_symlink() or not path.is_file() or path.stat().st_uid != metadata["uid"] or path.stat().st_mode & 0o077:
+                raise DeploymentError("The hosts' files must be private regular files owned by the service account")
+        # Both must read, but the records need not match yet: they follow from the settings and
+        # hosts.json, so an interrupted change is put right by start, set-hosts or update-dns.
+        read_hosts(directory)
+        read_hosts_records(directory)
+        if not cert_covers(directory / "ingress-control.crt", HOSTS_CHECK + spec["dns_base_domain"]):
+            raise DeploymentError(f"The public certificate does not cover the names under {spec['dns_base_domain']} that hosts use")
     cert_pair(directory / "ingress-admin.crt", directory / "ingress-admin.key", metadata["spec"]["admin_host"])
     internal = [("headscale-internal", "headscale"), ("management-internal", "management")]
     if spec.get("identity"):
@@ -977,12 +1344,15 @@ class Runtime:
         self.identity = bool(spec.get("identity"))
         self.console = console_host(spec)
         self.gateway = bool(spec.get("gateway"))
+        self.hosts = bool(spec.get("hosts"))
         if self.identity:
             self.base += ["--file", IDENTITY_COMPOSE]
         if self.console:
             self.base += ["--file", CONSOLE_COMPOSE]
         if self.gateway:
             self.base += ["--file", GATEWAY_COMPOSE]
+        if self.hosts:
+            self.base += ["--file", HOSTS_COMPOSE]
         if override:
             self.base += ["--file", override]
 
@@ -1158,6 +1528,8 @@ class Runtime:
         public = None
         if cert:
             cert_pair(Path(cert), Path(key), spec["control_host"])
+            if spec.get("hosts") and not cert_covers(Path(cert), HOSTS_CHECK + spec["dns_base_domain"]):
+                raise DeploymentError(f"The certificate must also cover every name under {spec['dns_base_domain']} (*.{spec['dns_base_domain']}), which the hosts use")
             public = read_source(cert), read_source(key, private=True)
         internal = [("headscale-internal", "headscale"), ("management-internal", "management")]
         if spec.get("identity"):
@@ -1170,6 +1542,8 @@ class Runtime:
             names += ["ingress-control.crt", "ingress-control.key"]
         if spec.get("identity"):
             names.append("identity-trust.pem")
+        if spec.get("hosts"):
+            names += [f"{HOSTS_TLS}/{name}" for name in ("privkey.pem", "fullchain.pem") if (directory / HOSTS_TLS / name).is_file()]
         previous = {name: (directory / name).read_bytes() for name in names}
         running = bool(self.compose("ps", "--quiet", "headscale").stdout.strip())
         try:
@@ -1184,6 +1558,10 @@ class Runtime:
                     os.replace(directory / f"{name}.renew.{ext}", directory / f"{name}.{ext}")
             if spec.get("identity"):
                 replace_private(directory / "identity-trust.pem", (directory / "internal-ca.crt").read_bytes() + (directory / "ingress-control.crt").read_bytes())
+            if spec.get("hosts"):
+                # The hosts device picks up its copy without a restart.
+                check_hosts_dirs(directory)
+                copy_hosts_certificate(directory)
             validate(directory, production=True)
             if running:
                 # Every service reads its certificates and trust only at startup.
@@ -1196,6 +1574,8 @@ class Runtime:
                 for ext in ("crt", "key"):
                     (directory / f"{name}.renew.{ext}").unlink(missing_ok=True)
             try:
+                if spec.get("hosts") and (directory / HOSTS_TLS).is_dir():
+                    copy_hosts_certificate(directory)
                 if running:
                     self.start()
             except DeploymentError:
@@ -1284,8 +1664,14 @@ class Runtime:
             spec["dns"] = custom
         else:
             spec.pop("dns", None)
+        records_path = self.directory / HOSTS_CONFIG / HOSTS_RECORDS_FILE
+        if spec.get("hosts"):
+            hosts = {entry.get("name") for entry in read_hosts(self.directory)}
+            if any(record["name"] in hosts for record in custom.get("extra_records", [])):
+                raise DeploymentError("An extra record uses the name of a host; remove the host first")
         config_path, metadata_path = self.directory / "headscale.yaml", self.directory / "deployment.json"
         previous = config_path.read_bytes(), metadata_path.read_bytes()
+        previous_records = records_path.read_bytes() if spec.get("hosts") else None
         config = load_json(config_path)
         config["dns"] = dns_config(spec)
         # Both private files must agree before restart; any interrupted update
@@ -1294,6 +1680,9 @@ class Runtime:
         replace_private(metadata_path, json.dumps(metadata, indent=2) + "\n")
         running = False
         try:
+            if spec.get("hosts"):
+                # With hosts, the custom records live in the hosts' records file.
+                write_hosts_records(self.directory, spec)
             validate(self.directory, production=not lab)
             running = bool(self.compose("ps", "--quiet", "headscale").stdout.strip())
             if running and coordinator_only:
@@ -1309,6 +1698,8 @@ class Runtime:
         except DeploymentError:
             replace_private(config_path, previous[0])
             replace_private(metadata_path, previous[1])
+            if previous_records is not None:
+                replace_private(records_path, previous_records, mode=0o600)
             try:
                 if running:
                     self.start()
@@ -1327,6 +1718,9 @@ class Runtime:
 
     def start(self):
         self.ensure_identity_state()
+        if self.hosts:
+            # The coordinator does not start without its records file.
+            ensure_hosts_files(self.directory, load_json(self.directory / "deployment.json")["spec"])
         self.pin_images()
         self.bootstrap()
         self.compose("up", "--detach", "--force-recreate", "management", timeout=120)
@@ -1336,11 +1730,15 @@ class Runtime:
             self.prepare_console_node()
         if self.gateway:
             self.prepare_gateway()
+        if self.hosts:
+            self.prepare_hosts_node()
         self.compose("up", "--detach", timeout=120)
         if self.console:
             self.finish_console_node()
         if self.gateway:
             self.finish_gateway()
+        if self.hosts:
+            self.finish_hosts_node()
 
     def prepare_console_node(self):
         """Allow members to reach the console device, and give a new device its one-time key."""
@@ -1398,13 +1796,262 @@ class Runtime:
             return
         (self.directory / GATEWAY_STATE / CONSOLE_JOIN_KEY).unlink(missing_ok=True)
 
+    def set_policy(self, text):
+        self.control("policy", "check", "--file", "/dev/stdin", data=text.encode())
+        self.control("policy", "set", "--file", "/dev/stdin", data=text.encode())
+
+    def prepare_hosts_node(self):
+        """Allow members to reach the hosts device and the hosts device each
+        host's device, and give a new hosts device its one-time key."""
+        check_hosts_dirs(self.directory)
+        merged = with_hosts_access(self.control("policy", "get").stdout.decode(), read_hosts(self.directory))
+        if merged:
+            self.set_policy(merged)
+        state = self.directory / HOSTS_NODE_STATE
+        if (state / CONSOLE_NODE_IDENTITY).exists():
+            return
+        self.delete_tagged_nodes(HOSTS_TAG, HOSTS_DEVICE)
+        key = self.create_device_key([HOSTS_TAG], expiration="1h")
+        replace_private(state / CONSOLE_JOIN_KEY, key["key"] + "\n", mode=0o600)
+
+    def finish_hosts_node(self):
+        """Wait for the hosts device; once it has joined, its join key is removed
+        and the hosts' names point at its address."""
+        try:
+            self.wait("hosts-node", timeout=90)
+        except DeploymentError:
+            # Standard error: commands that answer in JSON print only that on standard output.
+            print("The hosts device did not connect yet; check it with `docker compose logs hosts-node`.", file=sys.stderr, flush=True)
+            return
+        (self.directory / HOSTS_NODE_STATE / CONSOLE_JOIN_KEY).unlink(missing_ok=True)
+        self.refresh_hosts()
+
+    def refresh_hosts(self):
+        """Bring the hosts' addresses up to date from the coordinator: the hosts
+        device's (in the records file) and each target device's (in hosts.json
+        and the grants). Returns whether anything changed."""
+        nodes = self.list_nodes()
+        node = find_hosts_node(nodes)
+        if node is None or not node_addresses(node):
+            print("The hosts device has not joined the network yet; the hosts' names are not served until it has.", file=sys.stderr, flush=True)
+            return False
+        devices = {node_name(n): n for n in nodes if HOSTS_TAG not in node_tags(n)}
+        spec = load_json(self.directory / "deployment.json")["spec"]
+        entries = []
+        for entry in read_hosts(self.directory):
+            label = entry["name"].removesuffix("." + spec["dns_base_domain"])
+            device = devices.get(entry.get("device"))
+            if device is None or (entry.get("node_id") and node_identifier(device) != entry["node_id"]):
+                # Never move a host, its traffic and its grant to another device on its own.
+                problem = replaced_device_message(entry.get("device"), label) if device else f"No device named {entry.get('device')} in this network; host {label} keeps its last address."
+                print(problem, file=sys.stderr, flush=True)
+                entries.append(entry)
+                continue
+            addresses = target_addresses(device)
+            entries.append({**entry, "address": addresses[0], "node_id": node_identifier(device)} if addresses else entry)
+        merged = with_hosts_access(self.control("policy", "get").stdout.decode(), entries)
+        if merged:
+            self.set_policy(merged)
+        changed = write_hosts(self.directory, entries)
+        changed = write_hosts_records(self.directory, spec, node_addresses(node)) or changed
+        return bool(merged) or changed
+
+    def list_nodes(self):
+        try:
+            nodes = json.loads(self.control("nodes", "list", "--output", "json").stdout or b"[]") or []
+        except ValueError as error:
+            raise DeploymentError("The coordinator returned an unreadable device list") from error
+        if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
+            raise DeploymentError("The coordinator returned an unexpected device list")
+        return nodes
+
+    def coordinator_running(self):
+        return bool(self.compose("ps", "--quiet", "headscale").stdout.strip())
+
+    def set_hosts(self, raw):
+        """Make the network's hosts exactly raw's list, on a running network
+        without restarting anything: the grants first, then what the hosts
+        device serves, then the names. Every change is undone if anything fails."""
+        directory = self.directory
+        metadata = validate(directory, production=True)
+        spec = metadata["spec"]
+        if not spec.get("hosts"):
+            raise DeploymentError("Network-only hosts are not turned on for this network; turn them on first")
+        wanted = validate_hosts(raw, spec)
+        if not self.coordinator_running():
+            raise DeploymentError("The network is not running; start it, then change its hosts")
+        nodes = self.list_nodes()
+        node = find_hosts_node(nodes)
+        if node is None or not node_addresses(node):
+            raise DeploymentError("The hosts device has not joined the network yet; check it with `docker compose logs hosts-node`, then try again")
+        entries, warnings = resolve_hosts(wanted, nodes, spec, read_hosts(directory))
+        current = self.control("policy", "get").stdout.decode()
+        merged = with_hosts_access(current, entries)
+        paths = [directory / HOSTS_CONFIG / name for name in (HOSTS_FILE, HOSTS_RECORDS_FILE)]
+        previous = {path: path.read_bytes() for path in paths}
+        if merged:
+            try:
+                self.set_policy(merged)
+            except DeploymentError as error:
+                raise DeploymentError("The network's access policy would not take these hosts; nothing was changed. Check the policy in the console") from error
+        try:
+            changed = write_hosts(directory, entries)
+            changed = write_hosts_records(directory, spec, node_addresses(node)) or changed
+            validate(directory, production=True)
+        except (DeploymentError, OSError):
+            for path, value in previous.items():
+                replace_private(path, value, mode=0o600)
+            try:
+                if merged:
+                    self.set_policy(current)
+            except DeploymentError:
+                pass
+            raise DeploymentError("Changing the hosts failed; the previous hosts were restored. Check the runtime with status before relying on it")
+        reply = {"hosts": [{"name": entry["name"], "target": host_target(entry)} for entry in entries], "changed": bool(merged) or changed}
+        if warnings:
+            reply["warnings"] = warnings
+        return reply
+
+    def check_hosts(self, raw):
+        """What set-hosts would refuse, against the running coordinator, changing
+        nothing. Hosts need not be on, so a mistyped device is found before a
+        first host costs a certificate and a coordinator restart."""
+        metadata = validate(self.directory, production=True)
+        spec = metadata["spec"]
+        if not spec.get("identity"):
+            raise DeploymentError("Network-only hosts need the identity broker profile")
+        wanted = validate_hosts(raw, spec)
+        if not self.coordinator_running():
+            raise DeploymentError("The network is not running; start it, then check its hosts")
+        resolve_hosts(wanted, self.list_nodes(), spec, read_hosts(self.directory) if spec.get("hosts") else [])
+        return {"ok": True}
+
+    def enable_hosts(self, cert, key):
+        """Turn network-only hosts on, on a running runtime.
+
+        cert and key are the public certificate, which must now also cover every
+        name under the mesh domain. The coordinator restarts once. Every changed
+        file is restored if anything fails."""
+        directory = self.directory
+        metadata = validate(directory, production=True)
+        spec = metadata["spec"]
+        if spec.get("hosts"):
+            return {"hosts": True, "changed": False}
+        if not spec.get("identity"):
+            raise DeploymentError("Network-only hosts need the identity broker profile")
+        spec["hosts"] = True
+        base = spec["dns_base_domain"]
+        cert_pair(Path(cert), Path(key), spec["control_host"])
+        if not cert_covers(Path(cert), HOSTS_CHECK + base):
+            raise DeploymentError(f"The certificate must also cover every name under {base} (*.{base})")
+        if console_host(spec) and not cert_covers(Path(cert), console_host(spec)):
+            raise DeploymentError(f"The certificate must also name {console_host(spec)}")
+        public = read_source(cert), read_source(key, private=True)
+        names = ["deployment.json", "runtime.env", "headscale.yaml", "ingress-control.crt", "ingress-control.key", "identity-trust.pem"]
+        previous = {name: (directory / name).read_bytes() for name in names}
+        created = []
+        enabled = None
+        try:
+            created = create_hosts_dirs(directory)
+            check_hosts_dirs(directory)
+            replace_private(directory / "ingress-control.crt", public[0])
+            replace_private(directory / "ingress-control.key", public[1])
+            replace_private(directory / "identity-trust.pem", (directory / "internal-ca.crt").read_bytes() + (directory / "ingress-control.crt").read_bytes())
+            # Hosts come with set-hosts, once the hosts device has joined.
+            write_hosts(directory, [])
+            write_hosts_records(directory, spec, [])
+            copy_hosts_certificate(directory)
+            config = load_json(directory / "headscale.yaml")
+            config["dns"] = dns_config(spec)
+            replace_private(directory / "headscale.yaml", json.dumps(config, indent=2) + "\n")
+            replace_private(directory / "deployment.json", json.dumps(metadata, indent=2) + "\n")
+            replace_private(directory / "runtime.env", runtime_env(directory, metadata))
+            validate(directory, production=True)
+            # The gateway serves the new certificate and the coordinator reads its DNS
+            # settings only at start; start() stops the coordinator once, behind its policy gate.
+            self.compose("stop", "ingress", "management", "identity", timeout=60)
+            enabled = Runtime(directory)
+            enabled.start()
+        except (DeploymentError, OSError):
+            if enabled is not None:
+                enabled.compose("rm", "--stop", "--force", "hosts-node", timeout=60, check=False)
+            for name, value in previous.items():
+                replace_private(directory / name, value)
+            for path in created:
+                shutil.rmtree(path, ignore_errors=True)
+            # Folders kept from an earlier time with hosts on must not keep the new private key.
+            for name in ("privkey.pem", "fullchain.pem"):
+                (directory / HOSTS_TLS / name).unlink(missing_ok=True)
+            try:
+                self.start()
+                self.delete_tagged_nodes(HOSTS_TAG, HOSTS_DEVICE)
+                cleaned = without_hosts_access(self.control("policy", "get").stdout.decode())
+                if cleaned:
+                    self.set_policy(cleaned)
+            except DeploymentError:
+                pass
+            raise DeploymentError("Turning on hosts failed; the previous settings were restored. Check the runtime with status before relying on it")
+        return {"hosts": True, "changed": True}
+
+    def disable_hosts(self):
+        """Turn network-only hosts off on a running runtime: the hosts device
+        leaves, its grants go, and the coordinator restarts once with the custom
+        records back in its settings. Every changed file is restored if anything fails."""
+        directory = self.directory
+        metadata = validate(directory, production=True)
+        spec = metadata["spec"]
+        if not spec.get("hosts"):
+            return {"hosts": False, "changed": False}
+        if not self.coordinator_running():
+            raise DeploymentError("The network is not running; start it, then turn hosts off")
+        spec.pop("hosts")
+        names = ["deployment.json", "runtime.env", "headscale.yaml", f"{HOSTS_CONFIG}/{HOSTS_FILE}", f"{HOSTS_CONFIG}/{HOSTS_RECORDS_FILE}"]
+        previous = {name: (directory / name).read_bytes() for name in names}
+        current = self.control("policy", "get").stdout.decode()
+        cleaned = without_hosts_access(current)
+        try:
+            if cleaned:
+                self.set_policy(cleaned)
+            self.compose("rm", "--stop", "--force", "hosts-node", timeout=60, check=False)
+            self.delete_tagged_nodes(HOSTS_TAG, HOSTS_DEVICE)
+            (directory / HOSTS_NODE_STATE / CONSOLE_NODE_IDENTITY).unlink(missing_ok=True)
+            write_hosts(directory, [])
+            write_hosts_records(directory, {}, [])
+            config = load_json(directory / "headscale.yaml")
+            config["dns"] = dns_config(spec)
+            replace_private(directory / "headscale.yaml", json.dumps(config, indent=2) + "\n")
+            replace_private(directory / "deployment.json", json.dumps(metadata, indent=2) + "\n")
+            replace_private(directory / "runtime.env", runtime_env(directory, metadata))
+            validate(directory, production=True)
+            disabled = Runtime(directory)
+            disabled.pin_images()
+            # Without the hosts overlay the coordinator is recreated without the records file;
+            # the policy is already persisted, so the console and sign-in service keep running.
+            disabled.compose("up", "--detach", "--no-deps", "--force-recreate", "--remove-orphans", "headscale", timeout=120)
+            disabled.wait("headscale")
+        except (DeploymentError, OSError):
+            for name, value in previous.items():
+                replace_private(directory / name, value, mode=0o600 if name.startswith("state/") else 0o400)
+            try:
+                if cleaned:
+                    self.set_policy(current)
+            except DeploymentError:
+                pass
+            try:
+                Runtime(directory).start()
+            except DeploymentError:
+                pass
+            raise DeploymentError("Turning off hosts failed; the previous settings were restored. Check the runtime with status before relying on it")
+        # No copy of the private key stays behind to go stale.
+        for name in ("privkey.pem", "fullchain.pem"):
+            (directory / HOSTS_TLS / name).unlink(missing_ok=True)
+        return {"hosts": False, "changed": True}
+
     def delete_tagged_nodes(self, tag, name):
         """Remove earlier devices with this tag and name, so a device that lost
         its identity does not come back as name-1."""
-        nodes = json.loads(self.control("nodes", "list", "--output", "json").stdout or b"[]") or []
-        for node in nodes:
-            tags = [*(node.get("tags") or []), *(node.get("forced_tags") or []), *(node.get("valid_tags") or [])]
-            if tag in tags and node.get("given_name", "").startswith(name):
+        for node in self.list_nodes():
+            if tag in node_tags(node) and node_name(node).startswith(name):
                 self.control("nodes", "delete", "--identifier", str(node["id"]), "--force")
 
     def set_gateway(self, enabled):
@@ -1555,6 +2202,10 @@ class Runtime:
             raise DeploymentError("Renaming a network needs the identity broker profile")
         if any(p.get("kind") == "local" for p in spec["identity"]["providers"]):
             raise DeploymentError("Covee accounts sign in with passkeys that belong to the current name; turn Covee accounts off before renaming")
+        if spec.get("hosts"):
+            # Hosts' names, their records and the certificate's wildcard all belong to the current device names.
+            raise DeploymentError("This network has hosts, which are named under the devices' name suffix; turn them off first "
+                                  "(`covee host off <network>`), then rename, and add them again afterwards")
         if (control_host, dns_base_domain) == (spec["control_host"], spec["dns_base_domain"]):
             raise DeploymentError("The network already uses these names")
         renamed = json.loads(json.dumps(spec))
@@ -1647,12 +2298,14 @@ def build(*, include_identity=False):
         run(["docker", "build", "--file", ROOT / "deploy/Dockerfile.console-node", "--tag", CONSOLE_NODE_IMAGE, ROOT], timeout=1800)
         # Small, and needed only where the network has a gateway.
         run(["docker", "build", "--file", ROOT / "deploy/Dockerfile.gateway", "--tag", GATEWAY_IMAGE, ROOT], timeout=1800)
+        # Small, and needed only where the network has hosts.
+        run(["docker", "build", "--file", ROOT / "deploy/Dockerfile.hosts-node", "--tag", HOSTS_NODE_IMAGE, ROOT], timeout=1800)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["prepare", "validate", "build", "up", "down", "status", "rotate-api-key", "update-identity-grants", "update-identity-providers", "update-dns", "create-device-key", "renew-certificates", "enable-console-network", "rename", "local-accounts", "check", "backup", "restore",
-                                            "enable-gateway", "disable-gateway", "apply-gateway-dns"])
+                                            "enable-gateway", "disable-gateway", "apply-gateway-dns", "enable-hosts", "disable-hosts", "set-hosts", "check-hosts"])
     parser.add_argument("--directory", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output", type=Path, help="New encrypted backup file")
@@ -1661,8 +2314,8 @@ def main():
     parser.add_argument("--identity", type=Path, help="External age identity file; never stored in the runtime")
     parser.add_argument("--lab", action="store_true", help="Prepare disposable configuration only; never used by production up")
     parser.add_argument("--with-identity", action="store_true", help="Also build the optional social identity broker image")
-    parser.add_argument("--cert", help="renew-certificates, enable-console-network, rename: new public certificate chain for the control host")
-    parser.add_argument("--key", help="renew-certificates, enable-console-network, rename: private key of that certificate")
+    parser.add_argument("--cert", help="renew-certificates, enable-console-network, enable-hosts, rename: new public certificate chain for the control host")
+    parser.add_argument("--key", help="renew-certificates, enable-console-network, enable-hosts, rename: private key of that certificate")
     parser.add_argument("--control-host", help="rename: the new public hostname")
     parser.add_argument("--dns-base-domain", help="rename: the new name suffix of devices in the network")
     parser.add_argument("--tags", help="create-device-key: comma-separated tags such as tag:server")
@@ -1719,6 +2372,21 @@ def main():
                 print(json.dumps(runtime.apply_gateway_dns()))
             else:
                 print(json.dumps(runtime.set_gateway(args.command == "enable-gateway")))
+        elif args.command in ("enable-hosts", "disable-hosts", "set-hosts", "check-hosts"):
+            if args.command == "enable-hosts" and (not args.cert or not args.key):
+                raise DeploymentError("enable-hosts needs --cert and --key for a certificate that also covers every name under the network's device names")
+            if args.command in ("set-hosts", "check-hosts") and not args.config:
+                raise DeploymentError(args.command + " needs --config pointing to the complete intended hosts JSON object")
+            runtime = Runtime(directory)
+            operation_lock = runtime.acquire_lock()
+            if args.command == "enable-hosts":
+                print(json.dumps(runtime.enable_hosts(args.cert, args.key)))
+            elif args.command == "disable-hosts":
+                print(json.dumps(runtime.disable_hosts()))
+            elif args.command == "check-hosts":
+                print(json.dumps(runtime.check_hosts(load_json(args.config))))
+            else:
+                print(json.dumps(runtime.set_hosts(load_json(args.config))))
         elif args.command == "rename":
             if not args.control_host or not args.dns_base_domain or not args.cert or not args.key:
                 raise DeploymentError("rename needs --control-host, --dns-base-domain, and --cert and --key for a certificate naming the new hosts")

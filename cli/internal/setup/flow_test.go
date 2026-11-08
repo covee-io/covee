@@ -98,6 +98,19 @@ case "$last" in
   *"host_prepare.py' firewall"*) cat > "$STATE/firewall.json"; echo '{"firewall": "applied", "changed": true}' ;;
   *'scripts/deploy.py enable-gateway'*) printf '%s\n' "$last" > "$STATE/gateway-command"; touch "$STATE/gateway-on"; echo '{"gateway": true, "changed": true}' ;;
   *'scripts/deploy.py disable-gateway'*) printf '%s\n' "$last" > "$STATE/gateway-command"; rm -f "$STATE/gateway-on"; echo '{"gateway": false, "changed": true}' ;;
+  *'scripts/deploy.py check-hosts'*) printf '%s\n' "$last" >> "$STATE/hosts-checks"; [ -f "$STATE/fail-check-hosts" ] && { echo "ERROR: No device named mac-minni in this network" >&2; exit 1; }
+    echo '{"ok": true}' ;;
+  *'scripts/deploy.py enable-hosts'*) printf '%s\n' "$last" > "$STATE/hosts-enable"; [ -f "$STATE/fail-enable-hosts" ] && { echo "ERROR: The hosts device did not join the network; everything was restored" >&2; exit 1; }
+    touch "$STATE/hosts-on"; [ -f "$STATE/server-hosts.json" ] || echo '{"hosts": []}' > "$STATE/server-hosts.json"; echo '{"hosts": true, "changed": true}' ;;
+  *'scripts/deploy.py disable-hosts'*) printf '%s\n' "$last" > "$STATE/hosts-disable"; rm -f "$STATE/hosts-on" "$STATE/server-hosts.json"; echo '{"hosts": false, "changed": true}' ;;
+  *'scripts/deploy.py set-hosts'*)
+    printf '%s\n' "$last" >> "$STATE/hosts-calls"; [ -f "$STATE/fail-set-hosts" ] && { echo "ERROR: No device named mac-mini in this network" >&2; exit 1; }
+    [ -f "$STATE/set-hosts-reply" ] && { cat "$STATE/set-hosts-reply"; exit 0; }
+    sed 's/"name": "\(.*\)",/"name": "\1.mesh.coveetest.io",/' "$STATE/files/srv/covee/hosts.json" > "$STATE/server-hosts.json"
+    list=$(grep -o '"name": "[^"]*"' "$STATE/files/srv/covee/hosts.json" | sed 's/"name": "\(.*\)"/{"name": "\1.mesh.coveetest.io", "target": "http:\/\/x"}/' | paste -sd, -)
+    echo "{\"hosts\": [$list], \"changed\": true}" ;;
+  *'state/hosts/hosts.json'*) [ -f "$STATE/fail-read-hosts" ] && { echo "Permission denied" >&2; exit 1; }; cat "$STATE/server-hosts.json" 2>/dev/null; exit 0 ;;
+  *"docker ps --filter 'name=-hosts-node-'"*) [ -f "$STATE/hosts-on" ] && echo "Up 1 minute (healthy)" ;;
   *'sudo -n systemctl start covee-gateway-dns.service'*) echo gateway-dns-started >> "$STATE/units/actions" ;;
   *'scripts/deploy.py update-identity-providers'*) [ -f "$STATE/fail-providers" ] && { echo "broker unhealthy" >&2; exit 1; }; echo deployed ;;
   *'scripts/deploy.py rename '*)
@@ -756,6 +769,11 @@ func TestSetupCreatesAProxmoxVM(t *testing.T) {
 
 // writeBackup makes an age-encrypted runtime snapshot like deploy_backup.py does.
 func writeBackup(t *testing.T, path string, recipient age.Recipient, host string) {
+	writeBackupOf(t, path, recipient, host, nil, nil)
+}
+
+// writeBackupOf also adds spec fields and runtime files to the backup.
+func writeBackupOf(t *testing.T, path string, recipient age.Recipient, host string, extraSpec map[string]any, files map[string]string) {
 	var plain bytes.Buffer
 	tw := tar.NewWriter(&plain)
 	add := func(name, body string) {
@@ -770,6 +788,12 @@ func writeBackup(t *testing.T, path string, recipient age.Recipient, host string
 					"allowed_group_ids": []any{"00000000-0000-4000-8000-000000000003"}},
 				map[string]any{"id": "google", "kind": "google", "client_id": "1-x.apps.googleusercontent.com", "client_secret_file": "/run/identity-secrets/google-client-secret"}},
 			"grants": []any{map[string]any{"provider": "google", "subject": "100000000000000000001", "role": "Covee.Admin", "enroll": true}}}}}
+	for k, v := range extraSpec {
+		meta["spec"].(map[string]any)[k] = v
+	}
+	for name, body := range files {
+		add(name, body)
+	}
 	data, _ := json.Marshal(meta)
 	add("deployment.json", string(data))
 	add("state/headscale/db.sqlite", "SQLite format 3")

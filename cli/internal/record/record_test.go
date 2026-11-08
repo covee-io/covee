@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,36 @@ func TestCheckName(t *testing.T) {
 		if err := CheckName(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+func TestHostsAreKept(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := &Network{Name: "home", HostsEnabled: true, Hosts: []Host{
+		{Name: "grafana", Device: "mac-mini", Port: 8080, Path: "/some/sub/service", Scheme: "http"},
+		{Name: "nas", Device: "nas", Port: 5001, Scheme: "https", NoVerify: true},
+	}}
+	if err := s.Save(n); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(s.Dir, "home.json"))
+	for _, want := range []string{`"hosts_enabled": true`, `"no_verify": true`, `"path": "/some/sub/service"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("record lacks %s:\n%s", want, raw)
+		}
+	}
+	got, err := s.Load("home")
+	if err != nil || !got.HostsEnabled || len(got.Hosts) != 2 || got.Hosts[1] != n.Hosts[1] {
+		t.Fatalf("loaded %+v, %v", got, err)
+	}
+	if err := s.Save(&Network{Name: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(filepath.Join(s.Dir, "work.json"))
+	if strings.Contains(string(raw), "hosts") {
+		t.Fatalf("a network without hosts mentions them:\n%s", raw)
 	}
 }

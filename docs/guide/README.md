@@ -7,7 +7,8 @@ Covee builds a private network that you own: your devices reach each other direc
 3. [Set up your network](server.md) on a server, in about fifteen minutes.
 4. [Connect your devices](devices.md): Mac, iPhone, Linux and more.
 5. [Reach private networks through the gateway](gateway.md), such as a cloud's private endpoints, and services that allow only one address.
-6. [Run your network](operations.md): people, devices, updates, backups and certificates.
-7. [Security](security.md): what protects your network, and what you are responsible for.
+6. [Give your services their own addresses](hosts.md), such as `https://grafana.mesh.example.com`, for devices in the network.
+7. [Run your network](operations.md): people, devices, updates, backups and certificates.
+8. [Security](security.md): what protects your network, and what you are responsible for.
 
 For every command and option, see the [covee CLI reference](../cli.md).

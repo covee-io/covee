@@ -102,6 +102,10 @@ covee auth remove <network> microsoft|google|apple|accounts  # turn one off
 covee users list|invite|update|reset|remove <network> ...  # Covee accounts
 covee device token <network> [--tag server] [--expires 24h] [--reusable] [--ephemeral]
 covee gateway <network> [--off]  # a gateway device on the server, to reach private networks
+covee host add <network> <name> --to <device>:<port>[/path] [--https] [--no-verify]  # an address for a service, for devices in the network
+covee host list <network>      # every host and where it goes
+covee host remove <network> <name>
+covee host off <network>       # remove every host and the hosts device
 covee cert renew <network>     # new public certificate plus the 90-day internal ones
 covee backup <network>         # encrypted backup, downloaded and verified
 covee update <network>         # install this CLI's Covee files and restart
@@ -154,6 +158,12 @@ Google and Apple accounts need one approval:
 - **Using an exit node.** In the Mac app's **Exit node** section or the menu bar's **Exit node** menu, and in the iPhone app, pick the machine. *Allow local network access* keeps printers and other local devices reachable while traffic goes through it.
 - **A Mac as an exit node.** Turn on *Offer this Mac as an exit node* in the Mac app's **Exit node** section or the menu bar's **Exit node** menu, then approve it in the console like any other machine. The app relays the traffic itself, as Tailscale's macOS client does, so it is somewhat slower than Linux. While approved, the Mac stays awake as long as the Covee app is open (the display can still sleep; closing a laptop's lid still sleeps it). Like Tailscale, it shares the internet but not the Mac's own local network. A device cannot offer an exit node and use one at the same time. An iPhone cannot be an exit node.
 - **After a Mac app update,** disconnect and connect once in Covee so macOS switches to the new network extension.
+
+**Hosts.** `covee host add <network> grafana --to mac-mini:8080/some/sub/service` lets devices in the network open `https://grafana.<mesh domain>`. See the [guide](guide/hosts.md).
+- **The hosts device.** A small service on the server joins the network as the tagged device `hosts` (`tag:covee-hosts`), using Tailscale's tsnet library in user space. It serves ports 443 and 80 in the network only, and passes each request to its target through the network, keeping the original `Host` header and setting `X-Forwarded-Host`, `-Proto` and `-For`. It dials only addresses inside the network.
+- **Names.** Each host name is a DNS record inside the network's mesh domain, pointing at the hosts device. The coordinator reloads the records from a file, so no restart is needed. Devices send only that domain to the network's resolver, which is why hosts live under it.
+- **The certificate.** The first host renews the public certificate to cover `*.<mesh domain>`, which needs a DNS-01 challenge, and restarts the coordinator once. `covee cert renew` keeps the wildcard.
+- **Access rules.** People's devices may reach `tcp:443` and `tcp:80` of the hosts device. The hosts device may reach only each host's address and port. Covee owns every grant whose source is exactly `tag:covee-hosts`, and replaces them when the hosts change; it doesn't touch other rules.
 
 **A gateway to private networks.** `covee gateway <network>` adds a gateway device on the server, so devices in the network can reach places only the server can: a cloud's private networks (for example Azure's Key Vault and AKS behind private endpoints), or the internet with the server's own address, for services that allow only that address. `covee gateway <network> --off` removes the device and keeps its settings for next time. Run `covee update` first.
 - **Choosing what goes through it.** On the console's **Gateway** page, add entries: a name, one or more destinations (address ranges such as `10.20.0.0/16`, addresses, or host names such as `cluster0-shard-00-00.abc.mongodb.net`), and who may use them (everyone in the network, or chosen people). Everything else goes from each device directly. Host names are looked up from the server every 5 minutes, so private names get their private addresses; a name that fails to resolve keeps its previous addresses.

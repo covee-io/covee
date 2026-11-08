@@ -145,6 +145,27 @@ final class ClientSafetyTests: XCTestCase {
         XCTAssertNil(ProviderStatus.empty.consoleURL)
     }
 
+    func testANetworkThatHasNotConnectedYetIsListedFirstAndNotSaved() throws {
+        var saved = SavedNetworks()
+        saved.remember(ClientConfiguration(controlURL: "https://control.example.com", hostname: "mac"), suffix: nil)
+        let pending = saved.including(ClientConfiguration(controlURL: "https://Office.Example.org/", hostname: "Mac"))
+        XCTAssertEqual(pending.map(\.host), ["office.example.org", "control.example.com"])
+        XCTAssertEqual(saved.networks.map(\.host), ["control.example.com"])
+        XCTAssertEqual(saved.including(ClientConfiguration(controlURL: "https://control.example.com", hostname: "mac")).count, 1)
+        XCTAssertEqual(saved.including(ClientConfiguration(controlURL: "not an address", hostname: "mac")).count, 1)
+    }
+
+    func testAChangedDeviceNameIsCheckedAndKeptForThatNetworkOnly() throws {
+        var saved = SavedNetworks()
+        saved.remember(ClientConfiguration(controlURL: "https://a.example.com", hostname: "mac"), suffix: nil)
+        saved.remember(ClientConfiguration(controlURL: "https://b.example.com", hostname: "mac"), suffix: nil)
+        let a = try XCTUnwrap(saved.networks.first { $0.host == "a.example.com" })
+        try saved.setHostname("Work-Mac", for: a)
+        XCTAssertEqual(saved.networks.first { $0.host == "a.example.com" }?.hostname, "work-mac")
+        XCTAssertEqual(saved.networks.first { $0.host == "b.example.com" }?.hostname, "mac")
+        XCTAssertThrowsError(try saved.setHostname("not valid", for: a))
+    }
+
     func testSavedNetworksPutTheLatestFirstAndOfferTheExtensionsSignIns() throws {
         var saved = SavedNetworks()
         saved.remember(ClientConfiguration(controlURL: "https://Control.Example.com/", hostname: "Phone"), suffix: "home.example.com.")

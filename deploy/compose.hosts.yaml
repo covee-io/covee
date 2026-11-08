@@ -1,0 +1,87 @@
+# Optional overlay for runtimes with network-only hosts (deployment field
+# hosts). The hosts node joins the network as the tagged device "hosts" and
+# serves names such as grafana.<mesh domain> on its ports 443 and 80, passing
+# each request to the device, port and path that name stands for, through the
+# network. It reaches the coordinator and its relay through the gateway's alias
+# for the control host on the internal backend network. Its own egress network
+# carries the device's encrypted network traffic, so it can connect directly to
+# devices where the network allows instead of relaying every request both ways.
+# Requests never leave through it: the node connects to a target only inside
+# the network's own stack and only while the target is a current device, and
+# refuses any other address instead of handing it to the operating system.
+#
+# The deployment tool keeps the hosts settings in state/hosts: hosts.json,
+# which the hosts node reads, and extra-records.json, the coordinator's DNS
+# records pointing each name at the hosts node. It copies the network's public
+# certificate to state/hosts-tls. Both are replaced by renaming files, so the
+# directories are mounted, never single files.
+services:
+  headscale:
+    volumes:
+      # The DNS records for the hosts, which the coordinator reloads when they change.
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/hosts
+        target: /etc/covee-hosts
+        read_only: true
+        bind: {create_host_path: false}
+
+  hosts-node:
+    image: ${COVEE_HOSTS_NODE_IMAGE:-covee-hosts-node:portable-local}
+    environment:
+      COVEE_CONTROL_URL: https://${COVEE_CONTROL_HOST:?}
+      COVEE_HOSTS_HOSTNAME: hosts
+      COVEE_HOSTS_NODE_STATE: /var/lib/covee-hosts-node
+      COVEE_HOSTS_NODE_AUTHKEY_FILE: /var/lib/covee-hosts-node/join-key
+      COVEE_HOSTS_FILE: /etc/covee-hosts/hosts.json
+      COVEE_HOSTS_CERT: /run/covee-hosts-tls/fullchain.pem
+      COVEE_HOSTS_KEY: /run/covee-hosts-tls/privkey.pem
+      # Never upload logs to Tailscale's log service.
+      TS_NO_LOGS_NO_SUPPORT: "true"
+      HOME: /tmp
+    user: "${COVEE_UID:?}:${COVEE_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    pids_limit: 128
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    stop_grace_period: 10s
+    networks: [backend, hosts-egress]
+    depends_on:
+      ingress: {condition: service_started}
+    healthcheck:
+      test: [CMD, /covee-hosts-node, -health]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    ulimits:
+      nofile: {soft: 4096, hard: 4096}
+    logging:
+      driver: local
+      options: {max-size: "10m", max-file: "3"}
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${COVEE_UID:?},gid=${COVEE_GID:?}"
+    volumes:
+      # The device identity, and its one-time join key until it has joined.
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/hosts-node
+        target: /var/lib/covee-hosts-node
+        bind: {create_host_path: false}
+      # The hosts to serve, written by the deployment tool.
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/hosts
+        target: /etc/covee-hosts
+        read_only: true
+        bind: {create_host_path: false}
+      # The network's public certificate, which covers every name under the mesh domain.
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/hosts-tls
+        target: /run/covee-hosts-tls
+        read_only: true
+        bind: {create_host_path: false}
+
+networks:
+  hosts-egress: {}

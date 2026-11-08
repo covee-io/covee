@@ -1,0 +1,13 @@
+ARG GO_IMAGE=golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c
+FROM ${GO_IMAGE} AS build
+WORKDIR /src
+COPY deploy/hosts-node/go.mod deploy/hosts-node/go.sum ./
+RUN go mod download
+COPY deploy/hosts-node/*.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /covee-hosts-node .
+
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /covee-hosts-node /covee-hosts-node
+USER 10001:10001
+ENTRYPOINT ["/covee-hosts-node"]

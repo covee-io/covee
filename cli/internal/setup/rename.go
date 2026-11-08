@@ -55,6 +55,9 @@ func Rename(ctx context.Context, env *Env, name, hostname, meshDomain string) er
 	if old.SignIn.Local != nil {
 		return fmt.Errorf("Covee accounts sign in with passkeys that belong to %s; turn them off with `covee auth remove %s accounts` before renaming", old.Hostname, old.Name)
 	}
+	if old.HostsEnabled {
+		return fmt.Errorf("network %s has hosts, which are named under %s; remove the hosts first (`covee host off %s` removes them all), then rename, and add them again afterwards", old.Name, old.DNSBaseDomain, old.Name)
+	}
 	archive := env.Archive
 	if archive == nil {
 		archive = payload.Archive

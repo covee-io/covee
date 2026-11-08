@@ -113,7 +113,7 @@ func (i *Issuer) Obtain(ctx context.Context, host string, also ...string) (*Resu
 		return nil, nil, err
 	}
 	for _, name := range names {
-		if err := leaf.VerifyHostname(name); err != nil {
+		if err := leaf.VerifyHostname(probeName(name)); err != nil {
 			return nil, nil, fmt.Errorf("issued certificate does not cover %s: %w", name, err)
 		}
 	}
@@ -154,8 +154,12 @@ func (i *Issuer) authorize(ctx context.Context, client *acme.Client, url string)
 	if err != nil {
 		return err
 	}
-	name := "_acme-challenge." + z.Identifier.Value
-	i.say("  Proving control of %s with a temporary DNS record...", z.Identifier.Value)
+	name := challengeName(z)
+	shown := z.Identifier.Value
+	if z.Wildcard {
+		shown = "every name under " + strings.TrimPrefix(shown, "*.")
+	}
+	i.say("  Proving control of %s with a temporary DNS record...", shown)
 	if err := i.DNS.SetTXT(ctx, name, value); err != nil {
 		return err
 	}
@@ -174,6 +178,24 @@ func (i *Issuer) authorize(ctx context.Context, client *acme.Client, url string)
 		return fmt.Errorf("the domain check failed: %w", err)
 	}
 	return nil
+}
+
+// challengeName is the TXT record that proves control of an authorization's
+// name. A wildcard name (*.mesh.example.org) is proved at its base name
+// (_acme-challenge.mesh.example.org); its authorization already names the
+// base, without "*.", but a leading "*." is dropped in case a CA keeps it.
+func challengeName(z *acme.Authorization) string {
+	return "_acme-challenge." + strings.TrimPrefix(z.Identifier.Value, "*.")
+}
+
+// probeName is a host name a certificate for name must cover. A wildcard
+// name is checked with one name it covers, since VerifyHostname takes host
+// names, not patterns.
+func probeName(name string) string {
+	if base, ok := strings.CutPrefix(name, "*."); ok {
+		return "covee-hosts-check." + base
+	}
+	return name
 }
 
 func loadOrCreateKey(existing []byte) (crypto.Signer, []byte, error) {
