@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -6,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -291,6 +293,21 @@ class HostsTests(unittest.TestCase):
 
     # The access policy
 
+    def test_a_host_whose_device_is_gone_does_not_stop_other_changes(self):
+        spec = {"dns_base_domain": "mesh.covee.io", "control_host": "control.covee.io", "admin_host": "admin.covee.io"}
+        gone = {"name": "wiki.mesh.covee.io", "address": "100.64.0.9", "port": 80, "path": "", "scheme": "http", "verify": True, "device": "laptop", "node_id": "9"}
+        kept = {"name": "wiki", "device": "laptop", "port": 80, "path": "", "scheme": "http", "verify": True}
+        added = {"name": "grafana", "device": "mac-mini", "port": 8080, "path": "", "scheme": "http", "verify": True}
+        entries, warnings = deploy.resolve_hosts([kept, added], NODES, spec, [gone])
+        self.assertEqual(entries[0], gone)
+        self.assertEqual(entries[1]["device"], "mac-mini")
+        self.assertEqual(warnings, ["Host wiki: No device named laptop in this network"])
+        # Changing that host, or adding another for the same device, is still refused.
+        with self.assertRaisesRegex(deploy.DeploymentError, "No device named laptop"):
+            deploy.resolve_hosts([{**kept, "port": 81}], NODES, spec, [gone])
+        with self.assertRaisesRegex(deploy.DeploymentError, "No device named laptop"):
+            deploy.resolve_hosts([kept, {**kept, "name": "other"}], NODES, spec, [gone])
+
     def test_policy_gets_the_hosts_grants_once_and_replaces_stale_ones(self):
         entries = [{"address": "100.64.0.7", "port": 8080}, {"address": "100.64.0.7", "port": 8080}, {"address": "fd7a:115c:a1e0::8", "port": 80}]
         text = '''{
@@ -406,6 +423,141 @@ class HostsTests(unittest.TestCase):
 
     # Custom DNS settings
 
+    def console_request(self, directory, hosts, revision=None, expires=None, identifier="request-1"):
+        """What the console's Hosts page writes for the server to apply."""
+        path = directory / deploy.HOSTS_CONFIG / deploy.HOSTS_FILE
+        folder = directory / deploy.HOSTS_REQUESTS
+        folder.mkdir(mode=0o700, exist_ok=True)
+        request = {"id": identifier, "revision": revision or hashlib.sha256(path.read_bytes() if path.exists() else b"").hexdigest(),
+                   "expires": expires or int(time.time()) + 60, "hosts": hosts}
+        (folder / "request.json").write_text(json.dumps(request))
+        return folder / "status.json"
+
+    GRAFANA = {"name": "grafana", "device": "mac-mini", "port": 8080, "path": "/some/sub/service", "scheme": "http", "verify": True}
+
+    def test_a_console_request_changes_the_hosts_and_is_answered(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        status = self.console_request(directory, [self.GRAFANA])
+        with patch.object(deploy.Runtime, "compose", running), patch.object(runtime, "control", FakeCoordinator()):
+            self.assertEqual(runtime.apply_console_hosts(), {"answered": 1})
+        answer = json.loads(status.read_text())
+        self.assertEqual((answer["id"], answer["ok"], answer["warnings"]), ("request-1", True, []))
+        self.assertEqual([entry["name"] for entry in self.hosts_file(directory)["hosts"]], ["grafana.mesh.covee.io"])
+        self.assertEqual(status.stat().st_mode & 0o777, 0o600)
+
+    def test_a_console_request_is_applied_once(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        self.console_request(directory, [self.GRAFANA])
+        coordinator = FakeCoordinator()
+        with patch.object(deploy.Runtime, "compose", running), patch.object(runtime, "control", coordinator):
+            runtime.apply_console_hosts()
+            calls = len(coordinator.calls)
+            self.assertEqual(runtime.apply_console_hosts(), {"answered": 0})
+        self.assertEqual(len(coordinator.calls), calls)
+
+    def test_no_console_request_is_nothing_to_do(self):
+        directory = self.copy(self.hosts_template)
+        self.assertEqual(deploy.Runtime(directory).apply_console_hosts(), {"answered": 0})
+
+    def test_a_console_request_refused_by_the_server_says_why_and_changes_nothing(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        before = self.hosts_file(directory)
+        for hosts, why in (([{**self.GRAFANA, "device": "nope"}], "No device named nope"),
+                           ([{**self.GRAFANA, "name": "hosts"}], "name Covee uses itself"),
+                           ([{**self.GRAFANA, "name": "mac-mini"}], "already the name of a device"),
+                           ([{**self.GRAFANA, "path": "/../x"}], "The path of grafana")):
+            status = self.console_request(directory, hosts, identifier=hashlib.sha256(why.encode()).hexdigest()[:16])
+            with patch.object(deploy.Runtime, "compose", running), patch.object(runtime, "control", FakeCoordinator()):
+                runtime.apply_console_hosts()
+            answer = json.loads(status.read_text())
+            self.assertFalse(answer["ok"])
+            self.assertIn(why, answer["message"])
+            self.assertEqual(self.hosts_file(directory), before)
+
+    def test_a_console_request_from_an_old_list_is_a_conflict(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        status = self.console_request(directory, [self.GRAFANA], revision="0" * 64)
+        coordinator = FakeCoordinator()
+        with patch.object(deploy.Runtime, "compose", running), patch.object(runtime, "control", coordinator):
+            runtime.apply_console_hosts()
+        answer = json.loads(status.read_text())
+        self.assertTrue(answer["conflict"])
+        self.assertFalse(answer["ok"])
+        self.assertEqual(coordinator.calls, [])
+
+    def test_a_console_request_that_waited_too_long_is_not_applied(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        status = self.console_request(directory, [self.GRAFANA], expires=int(time.time()) - 1)
+        coordinator = FakeCoordinator()
+        with patch.object(deploy.Runtime, "compose", running), patch.object(runtime, "control", coordinator):
+            runtime.apply_console_hosts()
+        self.assertFalse(json.loads(status.read_text())["ok"])
+        self.assertEqual(coordinator.calls, [])
+
+    def test_a_console_request_during_another_operation_says_the_server_is_busy(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        status = self.console_request(directory, [self.GRAFANA])
+        with patch.object(runtime, "wait_for_lock", side_effect=deploy.DeploymentError("busy")):
+            runtime.apply_console_hosts()
+        answer = json.loads(status.read_text())
+        self.assertFalse(answer["ok"])
+        self.assertIn("busy", answer["message"])
+
+    def test_a_malformed_console_request_is_refused(self):
+        directory = self.copy(self.hosts_template)
+        folder = directory / deploy.HOSTS_REQUESTS
+        folder.mkdir(mode=0o700, exist_ok=True)
+        (folder / "request.json").write_text(json.dumps({"id": "../x", "revision": "r", "expires": 1, "hosts": []}))
+        with self.assertRaises(deploy.DeploymentError):
+            deploy.Runtime(directory).apply_console_hosts()
+
+    def test_a_network_that_already_has_hosts_still_validates_after_an_update_installs_these_files(self):
+        """Its runtime.env and state come from older files: no setting may become required."""
+        directory = self.copy(self.hosts_template)
+        (directory / deploy.HOSTS_CONFIG / deploy.HOSTS_DOMAIN_FILE).unlink()
+        self.assertNotIn("HOSTS_DOMAIN", (directory / "runtime.env").read_text())
+        deploy.validate(directory, production=True)
+        spec = self.spec(directory)
+        deploy.ensure_hosts_files(directory, spec)
+        self.assertEqual(json.loads((directory / deploy.HOSTS_CONFIG / deploy.HOSTS_DOMAIN_FILE).read_text()), {"domain": "mesh.covee.io"})
+        deploy.validate(directory, production=True)
+
+    def test_the_consoles_folder_cannot_lead_elsewhere(self):
+        directory = self.copy(self.hosts_template)
+        target = directory / "secrets"
+        before = sorted(path.name for path in target.iterdir())
+        (directory / deploy.HOSTS_REQUESTS).symlink_to(target)
+        with self.assertRaises(deploy.DeploymentError):
+            deploy.Runtime(directory).apply_console_hosts()
+        self.assertEqual(sorted(path.name for path in target.iterdir()), before)
+
+    def test_a_status_that_cannot_be_read_does_not_stop_answers(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        status = self.console_request(directory, [self.GRAFANA])
+        status.write_text("not json")
+        with patch.object(deploy.Runtime, "compose", running), patch.object(runtime, "control", FakeCoordinator()):
+            self.assertEqual(runtime.apply_console_hosts(), {"answered": 1})
+        self.assertTrue(json.loads(status.read_text())["ok"])
+
+    def test_a_status_that_is_a_link_is_replaced_not_followed(self):
+        directory = self.copy(self.hosts_template)
+        runtime = deploy.Runtime(directory)
+        status = self.console_request(directory, [self.GRAFANA])
+        outside = directory / "secrets" / "planted"
+        outside.write_text("untouched")
+        status.symlink_to(outside)
+        with patch.object(deploy.Runtime, "compose", running), patch.object(runtime, "control", FakeCoordinator()):
+            runtime.apply_console_hosts()
+        self.assertEqual(outside.read_text(), "untouched")
+        self.assertFalse(status.is_symlink())
+
     def test_update_dns_keeps_the_records_file_in_sync(self):
         directory = self.copy(self.hosts_template)
         runtime = deploy.Runtime(directory)
@@ -515,7 +667,7 @@ class HostsTests(unittest.TestCase):
             start.assert_not_called()
         self.assertIn((True, ("rm", "--stop", "--force", "hosts-node")), calls)
         # The coordinator restarts once, without the hosts overlay; nothing else restarts.
-        self.assertIn((False, ("up", "--detach", "--no-deps", "--force-recreate", "--remove-orphans", "headscale")), calls)
+        self.assertIn((False, ("up", "--detach", "--no-deps", "--force-recreate", "--remove-orphans", "headscale", "management")), calls)
         self.assertFalse(any(args[:1] == ("stop",) for _, args in calls))
         grants = json.loads(coordinator.policy)["grants"]
         self.assertEqual([g for g in grants if "tag:covee-hosts" in g["src"] + g["dst"]], [])
@@ -636,8 +788,10 @@ class HostsTests(unittest.TestCase):
         before = self.files(directory)
         coordinator.nodes = [{**NODES[0], "id": "44", "ip_addresses": ["100.64.0.44"]}, *NODES[1:]]
         message = "^The device mac-mini is not the same device as when host grafana was added. Remove the host and add it again if this is the right device.$"
-        with self.assertRaisesRegex(deploy.DeploymentError, message):
-            self.set_hosts(runtime, coordinator, grafana)
+        # Left as it was, the host stays pinned to the old device, with a warning.
+        reply = self.set_hosts(runtime, coordinator, grafana)
+        self.assertEqual(reply["warnings"], [deploy.replaced_device_message("mac-mini", "grafana")])
+        self.assertEqual(self.files(directory), before)
         with self.assertRaisesRegex(deploy.DeploymentError, message):
             self.set_hosts(runtime, coordinator, {**grafana, "port": 9090})
         self.assertEqual(self.files(directory), before)
@@ -672,15 +826,15 @@ class HostsTests(unittest.TestCase):
         coordinator.nodes = [{**NODES[0], "id": "44", "ip_addresses": ["100.64.0.44"]}, NODES[2]]
         # Each list still names a host with a replaced or missing device, and neither blocks the other's removal.
         reply = self.set_hosts(runtime, coordinator, second, third)
-        self.assertEqual(reply["warnings"], ["No device named pi in this network", deploy.replaced_device_message("mac-mini", "wiki")])
+        self.assertEqual(reply["warnings"], ["Host pihole: No device named pi in this network", deploy.replaced_device_message("mac-mini", "wiki")])
         self.assertEqual(self.hosts_file(directory)["hosts"], kept[1:], "kept as they were, not moved")
         self.assertEqual(self.set_hosts(runtime, coordinator, third)["warnings"], [deploy.replaced_device_message("mac-mini", "wiki")])
         self.assertEqual(self.set_hosts(runtime, coordinator), {"hosts": [], "changed": True})
-        # Anything but a removal is still refused.
+        # Changing a host is still refused when its device is gone.
         self.set_hosts(runtime, coordinator, {**first, "device": "mac-mini"})
         coordinator.nodes = [NODES[2]]
         with self.assertRaisesRegex(deploy.DeploymentError, "^No device named mac-mini in this network$"):
-            self.set_hosts(runtime, coordinator, first)
+            self.set_hosts(runtime, coordinator, {**first, "port": 9090})
 
     def test_a_start_never_moves_a_host_to_another_device(self):
         directory = self.copy(self.hosts_template)

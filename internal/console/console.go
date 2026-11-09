@@ -39,7 +39,7 @@ func Handler() http.Handler {
 			return
 		}
 		switch r.URL.Path {
-		case "/", "/index.html", "/overview", "/devices", "/users", "/keys", "/gateway", "/policy", "/audit":
+		case "/", "/index.html", "/overview", "/devices", "/users", "/keys", "/gateway", "/hosts", "/policy", "/audit":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(index))
 		case "/app.css", "/app.js":

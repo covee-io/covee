@@ -10,7 +10,7 @@ settings:
     SWIFT_VERSION: '5.0'
     CODE_SIGN_STYLE: Manual
     DEVELOPMENT_TEAM: ''
-    MARKETING_VERSION: '0.1.1'
+    MARKETING_VERSION: '0.1.2'
     # Quoted: unquoted, a JSON round trip of this spec turned it into YES.
     CURRENT_PROJECT_VERSION: '1'
     # '-development' selects the entitlements for archiving with development signing

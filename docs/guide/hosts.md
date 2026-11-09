@@ -19,7 +19,21 @@ The first host on a network asks you to confirm three changes:
 - The network's certificate is renewed to cover every name under that ending.
 - The coordinator restarts once, and devices reconnect within a minute.
 
-After that, adding or removing a host takes a few seconds and doesn't disconnect anyone.
+After that, adding or removing a host takes a few seconds and doesn't disconnect anyone, and you can do it on the console's **Hosts** page as well as with the command.
+
+## Use the console
+
+Once a network has its first host, the console's **Hosts** page lists every host, where it goes and whether its device is online. Admins can add, edit and remove hosts there:
+
+1. Choose **Add host**.
+2. Give it a name, choose the device, and enter the port. Add a path if the service lives under one.
+3. If the service itself uses HTTPS, tick **The service itself uses HTTPS**. If its certificate is self-signed, also tick **Don't check its certificate**.
+
+The form shows the address it will open at. People who can only view the console see the list but can't change it.
+
+The first host still needs the command, because renewing the certificate uses your DNS login, which stays on the computer that manages the network and never goes on the server.
+
+The page and the command change the same list. If it changed after you opened the page, the page asks you to refresh rather than overwrite the change.
 
 ## What the service needs
 
@@ -47,4 +61,5 @@ Covee adds the access rules for this by itself: people's devices may reach the h
 ## Good to know
 
 - A host's name can't be the same as a device's name, because both end in the same way. The names `hosts`, `console`, `gateway` and `admin` are reserved.
+- If a host's device is removed or renamed, the host stops working and is marked on the **Hosts** page, but you can still change other hosts. Remove it, then add it again if you need it. A host never moves to another device by itself, even one that takes the same name.
 - To rename a network that has hosts, run `covee host off <network>` first, then rename it and add the hosts again.

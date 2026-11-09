@@ -47,6 +47,7 @@ type Server struct {
 	policyMu  sync.Mutex
 	oidc      *oidcAuthenticator
 	gateway   *gatewayService // nil when the network has no gateway
+	hosts     *hostsService   // nil when the network has no hosts
 }
 
 func New(c Config) (*Server, error) {
@@ -84,7 +85,13 @@ func newServer(c Config, oidcClient *http.Client) (*Server, error) {
 		a.close()
 		return nil, err
 	}
-	s := &Server{config: c, upstream: u, audit: a, sessions: map[string]session{}, attempts: map[string]loginAttempts{}, oidc: auth, gateway: gw}
+	hostsSvc, err := newHosts(c)
+	if err != nil {
+		gw.stop()
+		a.close()
+		return nil, err
+	}
+	s := &Server{config: c, upstream: u, audit: a, sessions: map[string]session{}, attempts: map[string]loginAttempts{}, oidc: auth, gateway: gw, hosts: hostsSvc}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { respond(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("GET /auth/config", func(w http.ResponseWriter, r *http.Request) {
@@ -332,6 +339,16 @@ func revision(policy string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// requestError is a failure whose message is for the person who made the
+// request, unlike the coordinator's, which are never shown as they come.
+type requestError struct {
+	status        int
+	code, message string
+	uncertain     bool
+}
+
+func (e *requestError) Error() string { return e.message }
+
 // mutate journals an intent durably before invoking Headscale. A missing result
 // after a process crash is deliberately visible as an unresolved intent.
 func (s *Server) mutate(w http.ResponseWriter, r *http.Request, action, target string, fn func() (any, error), status int) {
@@ -347,12 +364,18 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, action, target s
 	if err != nil {
 		outcome = "failed"
 		var ue *upstreamError
-		if errors.As(err, &ue) && ue.uncertain {
+		var re *requestError
+		if (errors.As(err, &ue) && ue.uncertain) || (errors.As(err, &re) && re.uncertain) {
 			outcome = "uncertain"
 		}
 	}
 	if auditErr := s.audit.append(action, target, outcome, id, actor); auditErr != nil {
 		fail(w, 503, "audit_result_failed", "Audit result persistence failed; the operation may have completed. Inspect current state before retrying.")
+		return
+	}
+	var re *requestError
+	if errors.As(err, &re) {
+		fail(w, re.status, re.code, re.message)
 		return
 	}
 	if err != nil {

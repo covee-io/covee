@@ -58,6 +58,10 @@ HOSTS_TAG = "tag:covee-hosts"
 HOSTS_DEVICE = "hosts"
 # The device identity, like the console node's (covee-joined, join-key).
 HOSTS_NODE_STATE = "state/hosts-node"
+# The console's Hosts page asks for changes here (request.json, written by the
+# management service) and apply-console-hosts answers (status.json).
+HOSTS_REQUESTS = "state/management/hosts"
+HOSTS_DOMAIN_FILE = "domain.json"
 # hosts.json for the hosts device and extra-records.json for the coordinator,
 # both read from /etc/covee-hosts.
 HOSTS_CONFIG = "state/hosts"
@@ -835,10 +839,11 @@ def resolve_hosts(hosts, nodes, spec, existing=()):
     and address, and warnings for the person changing them.
 
     existing is what hosts.json holds now. A name another device has taken is
-    refused only for a new host; an existing one gets a warning. Taking hosts
-    away always works: the hosts that stay are kept as they are, with a warning,
-    whatever has happened to their devices, or two hosts whose devices were
-    replaced could never be removed, since each list would still name the other."""
+    refused only for a new host; an existing one gets a warning. Only the hosts
+    being added or changed are refused because of their devices. One left as it
+    was is kept as it is, with a warning, whatever has happened to its device, or
+    a single removed device would stop every other change to the network's hosts,
+    and two hosts whose devices were replaced could never be removed."""
     base = spec["dns_base_domain"]
     current = {entry["name"]: entry for entry in existing}
     devices = {node_name(node): node for node in nodes if HOSTS_TAG not in node_tags(node)}
@@ -848,7 +853,6 @@ def resolve_hosts(hosts, nodes, spec, existing=()):
         entry = current.get(host["name"] + "." + base)
         return entry is not None and all(entry.get(key) == host[key] for key in ("device", "port", "path", "scheme", "verify"))
 
-    removing = len(hosts) < len(current) and all(unchanged(host) for host in hosts)
     entries, warnings = [], []
     for host in hosts:
         label, device, full = host["name"], host["device"], host["name"] + "." + base
@@ -867,9 +871,9 @@ def resolve_hosts(hosts, nodes, spec, existing=()):
         elif not target_addresses(node):
             problem = f"{device} has no address in this network yet"
         if problem:
-            if not removing:
+            if not unchanged(host):
                 raise DeploymentError(problem)
-            warnings.append(problem)
+            warnings.append(problem if f"host {label}" in problem else f"Host {label}: {problem}")
             entries.append(old)
             continue
         entries.append({"name": full, "address": target_addresses(node)[0], "port": host["port"], "path": host["path"],
@@ -1063,11 +1067,22 @@ def copy_hosts_certificate(directory):
     return changed
 
 
+def write_hosts_domain(directory, spec):
+    """The ending of the network's device names, for the console's Hosts page.
+    A file rather than a setting in runtime.env, which is compared strictly: a
+    network that already has hosts gets it from the update's start, and until
+    then nothing that checks the runtime fails."""
+    path, data = directory / HOSTS_CONFIG / HOSTS_DOMAIN_FILE, json.dumps({"domain": spec["dns_base_domain"]}) + "\n"
+    if not path.is_file() or path.read_text() != data:
+        replace_private(path, data, mode=0o600)
+
+
 def ensure_hosts_files(directory, spec):
-    """The coordinator needs the records file before it starts, and the hosts device its files."""
+    """The coordinator needs the records file before it starts, and the hosts device and console their files."""
     check_hosts_dirs(directory)
     if not (directory / HOSTS_CONFIG / HOSTS_FILE).exists():
         write_hosts(directory, [])
+    write_hosts_domain(directory, spec)
     write_hosts_records(directory, spec)
     copy_hosts_certificate(directory)
 
@@ -1912,6 +1927,90 @@ class Runtime:
             reply["warnings"] = warnings
         return reply
 
+    def console_hosts_folder(self):
+        """The folder shared with the management container, which is less trusted
+        than this process: it must not lead anywhere else on the server."""
+        folder = self.directory / HOSTS_REQUESTS
+        try:
+            info = folder.lstat()
+        except FileNotFoundError:
+            return folder
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise DeploymentError("The console's hosts folder must be a private directory owned by the service account")
+        return folder
+
+    def console_answered(self):
+        """The id of the last request answered. An answer that can't be read counts as none."""
+        path = self.console_hosts_folder() / "status.json"
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1 << 20:
+                return None
+            return json.loads(path.read_text()).get("id")
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def read_console_request(self):
+        """What the console's Hosts page last asked for (written by the management service), or None."""
+        path = self.console_hosts_folder() / "request.json"
+        if not path.exists() and not path.is_symlink():
+            return None
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1 << 20:
+            raise DeploymentError("The console's hosts request is not a small regular file")
+        request = load_json(path)
+        if (not isinstance(request, dict) or set(request) != {"id", "revision", "expires", "hosts"}
+                or not isinstance(request["id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request["id"])
+                or not isinstance(request["revision"], str) or type(request["expires"]) is not int):
+            raise DeploymentError("The console's hosts request has unexpected fields")
+        return request
+
+    def apply_console_request(self, request):
+        """The answer to one request. Everything set-hosts refuses goes back to
+        the page in its own words; nothing is thrown, so the page always hears."""
+        if time.time() > request["expires"]:
+            return {"ok": False, "message": "This change waited too long for the server and was not made. Try again."}
+        try:
+            lock = self.wait_for_lock()
+        except DeploymentError:
+            return {"ok": False, "message": "The server is busy with another change. Try again in a minute."}
+        try:
+            path = self.directory / HOSTS_CONFIG / HOSTS_FILE
+            held = path.read_bytes() if path.exists() else b""
+            if hashlib.sha256(held).hexdigest() != request["revision"]:
+                return {"ok": False, "conflict": True, "message": "The hosts changed since this page loaded."}
+            reply = self.set_hosts({"hosts": request["hosts"]})
+            return {"ok": True, "warnings": reply.get("warnings", []), "changed": reply["changed"]}
+        except DeploymentError as error:
+            return {"ok": False, "message": str(error)}
+        finally:
+            lock.close()
+
+    def wait_for_lock(self, seconds=15):
+        """The operation lock, for a person waiting on a page: another change
+        usually ends soon, and being refused at once would look like a fault."""
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                return self.acquire_lock()
+            except DeploymentError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
+
+    def apply_console_hosts(self):
+        """Answer what the console's Hosts page asked for, in status.json. A
+        request that arrives during this one is picked up before leaving,
+        because the path unit does not start again while this runs."""
+        answered = 0
+        while True:
+            request = self.read_console_request()
+            if request is None or self.console_answered() == request["id"]:
+                return {"answered": answered}
+            answer = self.apply_console_request(request)
+            status = self.console_hosts_folder() / "status.json"
+            status.unlink(missing_ok=True)
+            replace_private(status, json.dumps({"id": request["id"], "at": utc_now(), **answer}) + "\n", mode=0o600)
+            answered += 1
+
     def check_hosts(self, raw):
         """What set-hosts would refuse, against the running coordinator, changing
         nothing. Hosts need not be on, so a mistyped device is found before a
@@ -1959,6 +2058,7 @@ class Runtime:
             replace_private(directory / "identity-trust.pem", (directory / "internal-ca.crt").read_bytes() + (directory / "ingress-control.crt").read_bytes())
             # Hosts come with set-hosts, once the hosts device has joined.
             write_hosts(directory, [])
+            write_hosts_domain(directory, spec)
             write_hosts_records(directory, spec, [])
             copy_hosts_certificate(directory)
             config = load_json(directory / "headscale.yaml")
@@ -2025,9 +2125,10 @@ class Runtime:
             validate(directory, production=True)
             disabled = Runtime(directory)
             disabled.pin_images()
-            # Without the hosts overlay the coordinator is recreated without the records file;
-            # the policy is already persisted, so the console and sign-in service keep running.
-            disabled.compose("up", "--detach", "--no-deps", "--force-recreate", "--remove-orphans", "headscale", timeout=120)
+            # Without the hosts overlay the coordinator is recreated without the records file and
+            # the console without its Hosts page; the policy is already persisted, so the sign-in
+            # service keeps running.
+            disabled.compose("up", "--detach", "--no-deps", "--force-recreate", "--remove-orphans", "headscale", "management", timeout=120)
             disabled.wait("headscale")
         except (DeploymentError, OSError):
             for name, value in previous.items():
@@ -2305,7 +2406,7 @@ def build(*, include_identity=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["prepare", "validate", "build", "up", "down", "status", "rotate-api-key", "update-identity-grants", "update-identity-providers", "update-dns", "create-device-key", "renew-certificates", "enable-console-network", "rename", "local-accounts", "check", "backup", "restore",
-                                            "enable-gateway", "disable-gateway", "apply-gateway-dns", "enable-hosts", "disable-hosts", "set-hosts", "check-hosts"])
+                                            "enable-gateway", "disable-gateway", "apply-gateway-dns", "enable-hosts", "disable-hosts", "set-hosts", "check-hosts", "apply-console-hosts"])
     parser.add_argument("--directory", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output", type=Path, help="New encrypted backup file")
@@ -2387,6 +2488,9 @@ def main():
                 print(json.dumps(runtime.check_hosts(load_json(args.config))))
             else:
                 print(json.dumps(runtime.set_hosts(load_json(args.config))))
+        elif args.command == "apply-console-hosts":
+            # Takes the operation lock for each request, so it can answer when it is busy.
+            print(json.dumps(Runtime(directory).apply_console_hosts()))
         elif args.command == "rename":
             if not args.control_host or not args.dns_base_domain or not args.cert or not args.key:
                 raise DeploymentError("rename needs --control-host, --dns-base-domain, and --cert and --key for a certificate naming the new hosts")

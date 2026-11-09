@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 (2026-11-09)
+
+- The console has a **Hosts** page. Once a network has its first host, admins can add, edit and remove hosts there, choosing the device from a list, and see whether each host's device is online. The first host still uses `covee host add`, which renews the certificate from the computer that manages the network. `covee update` adds the page to a network that already has hosts.
+- `covee host list` and `covee status` show the list on the server, since the console can change it too.
+- A host whose device was removed or replaced no longer stops you from changing other hosts. It's kept as it was, with a warning, and it still never moves to another device by itself.
+
 ## 0.1.1 (2026-11-08)
 
 - Covee for Mac and iPhone sign in through the browser while the VPN stays on. A network that asks for a sign-in no longer keeps its own sign-in page from loading, and the connection comes up once the sign-in finishes.

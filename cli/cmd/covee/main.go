@@ -435,7 +435,7 @@ func host(ctx context.Context, env *setup.Env, args []string) error {
 		if fs.NArg() != 1 {
 			return errors.New("usage: covee host list <network>")
 		}
-		return setup.HostList(env, fs.Arg(0))
+		return setup.HostList(ctx, env, fs.Arg(0))
 	case "remove":
 		if fs.NArg() != 2 {
 			return errors.New("usage: covee host remove <network> <name>")

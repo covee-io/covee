@@ -841,6 +841,11 @@ func writePrivateIfChanged(path string, data []byte) error {
 	if old, err := readPrivate(path); err == nil && string(old) == string(data) {
 		return nil
 	}
+	return writePrivate(path, data)
+}
+
+// writePrivate replaces path atomically, readable only by this account.
+func writePrivate(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
 	if err != nil {
 		return err

@@ -87,6 +87,10 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.getGateway(w, r)
 	case path == "gateway" && r.Method == "PUT":
 		s.setGateway(w, r)
+	case path == "hosts" && r.Method == "GET":
+		s.getHosts(w, r)
+	case path == "hosts" && r.Method == "PUT":
+		s.setHosts(w, r)
 	default:
 		fail(w, 404, "not_found", "API resource or method was not found")
 	}

@@ -9,7 +9,7 @@ import (
 
 func TestConsoleRoutesServeHTMLWithoutRedirect(t *testing.T) {
 	handler := Handler()
-	for _, path := range []string{"/", "/index.html", "/overview", "/devices", "/users", "/keys", "/gateway", "/policy", "/audit"} {
+	for _, path := range []string{"/", "/index.html", "/overview", "/devices", "/users", "/keys", "/gateway", "/hosts", "/policy", "/audit"} {
 		t.Run(path, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, path, nil)
 			w := httptest.NewRecorder()

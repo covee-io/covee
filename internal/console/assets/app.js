@@ -5,14 +5,14 @@
   const page = $('#page');
   const dialog = $('#dialog');
   const dialogContent = $('#dialog-content');
-  const routes = ['overview', 'devices', 'users', 'keys', 'gateway', 'policy', 'audit'];
+  const routes = ['overview', 'devices', 'users', 'keys', 'gateway', 'hosts', 'policy', 'audit'];
   const keyLifetimes = [['1 hour', 1], ['1 day', 24], ['7 days', 168], ['30 days', 720], ['90 days', 2160]];
   const isDefaultRoute = route => route === '0.0.0.0/0' || route === '::/0';
   const hostLabel = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
   const ipv4Network = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}\/(3[0-2]|[12]?\d)$/;
   const ipv6Network = /^[0-9a-f:]+\/(12[0-8]|1[01]\d|[1-9]?\d)$/i;
 
-  const titles = { overview: 'Overview', devices: 'Devices', users: 'Users', keys: 'Device keys', gateway: 'Gateway', policy: 'Access policy', audit: 'Activity' };
+  const titles = { overview: 'Overview', devices: 'Devices', users: 'Users', keys: 'Device keys', gateway: 'Gateway', hosts: 'Hosts', policy: 'Access policy', audit: 'Activity' };
   const state = { authenticated: false, canWrite: false, authMode: '', csrf: '', generation: 0, route: 'overview', epoch: 0, dirty: false, policy: '', revision: '', userId: '' };
   let dialogOrigin = null;
   let dialogLocked = false;
@@ -27,6 +27,7 @@
     keys: ['M14 10a5 5 0 1 0-4 4L21 3', 'M17 7l3 3', 'M14 10l3 3'],
     policy: ['M12 3l8 4v5c0 5-8 9-8 9s-8-4-8-9V7z', 'M9 12l2 2 4-4'],
     gateway: ['M4 12h11', 'M11 7l5 5-5 5', 'M20 4v16'],
+    hosts: ['M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0', 'M3 12h18', 'M12 3c2.5 2.5 3.8 5.5 3.8 9s-1.3 6.5-3.8 9', 'M12 3c-2.5 2.5-3.8 5.5-3.8 9s1.3 6.5 3.8 9'],
     audit: ['M3 12h4l3-8 4 16 3-8h4'],
     refresh: ['M20 7v5h-5', 'M4 17v-5h5', 'M6.1 7a7 7 0 0 1 11.55-2.2L20 8', 'M4 16l2.35 3.2A7 7 0 0 0 17.9 17'],
     plus: ['M12 5v14', 'M5 12h14'],
@@ -127,7 +128,7 @@
   async function api(path, options = {}) {
     const requestGeneration = state.generation;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20000);
+    const timer = setTimeout(() => controller.abort(), options.timeout || 20000);
     const headers = { Accept: 'application/json' };
     const method = options.method || 'GET';
     const changesState = method !== 'GET' && method !== 'HEAD';
@@ -326,6 +327,7 @@
     users: 'The people who can enroll devices in your network.',
     keys: 'Keys that add servers and computers to your network.',
     gateway: 'Choose what your devices reach through the gateway, and who may.',
+    hosts: 'Give a service on one of your devices its own address, for devices in this network.',
     policy: 'Choose which connections your network allows.',
     audit: 'A record of changes made through this console.',
   };
@@ -749,7 +751,130 @@
       () => saveGateway(settings => { settings.dns = settings.dns.filter(item => item.domain !== entry.domain); }).catch(gatewayError), 'Private DNS removed.');
   }
 
-  const loaders = { overview, devices: devicesView, users: usersView, keys: keysView, gateway: gatewayView, policy: policyView, audit: auditView };
+  // Hosts: addresses that devices in the network open, each passed on to a
+  // device and port. Every save sends the whole list with the revision it was
+  // loaded at; the server checks it and answers in its own words.
+  const reservedHostNames = ['hosts', 'console', 'gateway', 'admin'];
+  const hostStates = {
+    online: ['Device online', 'success', ''],
+    offline: ['Device offline', 'warning', 'Turn the device on and connect it to open this address.'],
+    renamed: ['Device renamed', 'warning', 'Remove this host and add it again with the device’s new name.'],
+    missing: ['Device removed', 'danger', 'Remove this host, or add the device again and then add the host again.'],
+  };
+
+  async function hostsView(epoch) {
+    const data = await api('/api/hosts');
+    if (!current(epoch)) return;
+    if (!data.enabled) {
+      const section = panel('No hosts yet', 'A host gives a service on one of your devices an address such as https://grafana.<your device ending>. Only devices in this network can open it.');
+      section.append(empty('Add the first host with the covee command', 'From the computer that manages the network, run covee host add <network> grafana --to mac-mini:8080. It renews the network’s certificate and restarts the coordinator once, so devices reconnect within a minute. After that you can add and change hosts here.', 'hosts'));
+      page.replaceChildren(heading('hosts', descriptions.hosts), section);
+      return;
+    }
+    state.hosts = data;
+    const parts = [];
+    if (!data.hostsDevice && !data.problem) parts.push(banner('The hosts device has not joined the network yet, so these addresses don’t open yet.', 'warning'));
+    else if (data.hostsDevice && !data.hostsDevice.online) parts.push(banner('The hosts device is offline, so these addresses don’t open right now.', 'error'));
+    if (data.problem) parts.push(banner(data.problem, 'warning'));
+    const add = writeButton('Add host', () => editHost(null), 'primary', 'plus');
+    const section = panel('Hosts', 'Each address opens a service on a device in this network.', add);
+    if (!data.hosts.length) section.append(empty('No hosts', 'Add one to open a service at an address of your choosing, such as https://grafana.' + data.domain + '.', 'hosts'));
+    else {
+      const rows = data.hosts.map(host => {
+        const row = el('tr');
+        const link = el('a', 'mono', host.url.replace('https://', '')); link.href = host.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+        const target = el('div', 'tag-list');
+        target.append(el('span', 'mono', host.device + ':' + host.port + (host.path || '')));
+        if (host.scheme === 'https') target.append(badge(host.verify ? 'HTTPS' : 'HTTPS, certificate not checked', host.verify ? '' : 'wrap warning'));
+        const [label, style, hint] = hostStates[host.status] || ['', '', ''];
+        const status = el('div', 'tag-list');
+        if (label) status.append(badge(label, style));
+        if (hint) status.append(el('span', 'field-hint', hint));
+        const actions = el('div', 'button-row');
+        actions.append(writeButton('Edit', () => editHost(host), 'quiet small'), writeButton('Remove', () => removeHost(host), 'quiet small'));
+        row.append(cell(link), cell(target), cell(status), cell(actions, 'action-cell'));
+        return row;
+      });
+      section.append(table(['Address', 'Goes to', 'Status', ''], rows, 'Hosts in this network'));
+    }
+    section.append(foot('Everyone with a signed-in device in this network can open these addresses. A service’s own sign-in, if it has one, still applies.'));
+    page.replaceChildren(heading('hosts', descriptions.hosts), ...parts, section);
+  }
+
+  // The list may have been reloaded while a dialog was open.
+  function hostIndex(hosts, host) {
+    const index = hosts.findIndex(item => item.name === host.name);
+    if (index < 0) throw new Error('This host is no longer in the list. Refresh and try again.');
+    return index;
+  }
+
+  async function saveHosts(change) {
+    const hosts = state.hosts.hosts.map(({ name, device, port, path, scheme, verify }) => ({ name, device, port, path, scheme, verify }));
+    change(hosts);
+    // The server may wait for another change to finish, longer than other requests take.
+    return api('/api/hosts', { method: 'PUT', body: { hosts, revision: state.hosts.revision }, timeout: 28000 });
+  }
+
+  function editHost(host) {
+    if (!state.canWrite) return;
+    const data = state.hosts;
+    const { body, footer } = showDialog(host ? 'Edit host' : 'Add a host', 'Open a service on a device at its own address.');
+    const form = el('form'); form.id = 'host-form';
+    const name = field(form, 'Name', 'host-name', 'text', ''); name.maxLength = 63; name.autocomplete = 'off'; name.value = host ? host.name : ''; name.disabled = !!host;
+    const address = el('p', 'field-hint'); address.id = 'host-address'; name.parentNode.append(address);
+    const showAddress = () => { address.textContent = 'Opens at https://' + (name.value.trim().toLowerCase() || 'name') + '.' + data.domain + (host ? '. To change the name, remove this host and add a new one.' : ''); };
+    name.addEventListener('input', showAddress); showAddress();
+    const wrap = el('div', 'field'); const deviceLabel = el('label', '', 'Device'); deviceLabel.htmlFor = 'field-host-device';
+    const device = el('select'); device.id = 'field-host-device';
+    const choices = [...data.devices];
+    if (host && !choices.some(item => item.name === host.device)) choices.unshift({ name: host.device, online: false, gone: true });
+    for (const item of choices) { const option = el('option', '', item.name + (item.gone ? ' (not in the network)' : item.online ? '' : ' (offline)')); option.value = item.name; device.append(option); }
+    if (host) device.value = host.device;
+    wrap.append(deviceLabel, device, el('p', 'field-hint', 'The service must accept connections from the network, not only from localhost. Set it to listen on 0.0.0.0.'));
+    form.append(wrap);
+    const port = field(form, 'Port', 'host-port', 'number', 'The port the service listens on.'); port.min = 1; port.max = 65535; port.value = host ? String(host.port) : '';
+    const path = field(form, 'Path', 'host-path', 'text', 'Optional. The folder the service lives under, such as /some/sub/service.'); path.maxLength = 1024; path.autocomplete = 'off'; path.value = host ? host.path : '';
+    const https = checkbox(form, 'The service itself uses HTTPS', 'host-https'); https.checked = !!host && host.scheme === 'https';
+    const skip = checkbox(form, 'Don’t check its certificate', 'host-skip', 'For a service with a self-signed certificate.'); skip.checked = !!host && !host.verify;
+    const syncSkip = () => { skip.parentNode.hidden = !https.checked; };
+    https.addEventListener('change', syncSkip); syncSkip();
+    const error = errorField(form); body.append(form);
+    const submit = writeButton(host ? 'Save' : 'Add host', null, 'primary'); submit.type = 'submit'; submit.setAttribute('form', form.id);
+    footer.append(button('Cancel', () => closeDialog(), 'quiet'), submit);
+    if (!choices.length) { error.textContent = 'This network has no devices to choose from yet.'; error.hidden = false; submit.disabled = true; }
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      const refuse = (message, input) => { error.textContent = message; error.hidden = false; input.focus(); };
+      const label = name.value.trim().toLowerCase();
+      if (!hostLabel.test(label)) return refuse('Use one word of lowercase letters, digits and dashes for the name, such as grafana.', name);
+      if (reservedHostNames.includes(label)) return refuse(label + ' is a name the network uses itself. Choose another one.', name);
+      if (!host && data.hosts.some(item => item.name === label)) return refuse('There is already a host named ' + label + '. Edit that one, or choose another name.', name);
+      if (!device.value) return refuse('Choose the device the service runs on.', device);
+      const number = Number(port.value);
+      if (!Number.isInteger(number) || number < 1 || number > 65535) return refuse('The port must be a number from 1 to 65535.', port);
+      let folder = path.value.trim();
+      if (folder && !folder.startsWith('/')) folder = '/' + folder;
+      if (folder === '/') folder = '';
+      const updated = { name: label, device: device.value, port: number, path: folder, scheme: https.checked ? 'https' : 'http', verify: !(https.checked && skip.checked) };
+      modalMutation(form, error, submit, () => saveHosts(hosts => {
+        if (host) hosts[hostIndex(hosts, host)] = updated; else hosts.push(updated);
+      }), result => {
+        closeDialog();
+        const warnings = result.warnings || [];
+        notify((host ? 'Host saved. ' : 'Host added. It opens within a few seconds. ') + warnings.join(' '));
+        loadRoute(state.route);
+      });
+    });
+    (host ? device : name).focus();
+  }
+
+  function removeHost(host) {
+    review('Remove this host?', 'Devices will no longer open this address. The service on the device isn’t affected.', host.url + ' → ' + host.device + ':' + host.port + (host.path || ''), 'Remove host',
+      () => saveHosts(hosts => { hosts.splice(hostIndex(hosts, host), 1); }),
+      result => 'Host removed. ' + (result.warnings || []).join(' '));
+  }
+
+  const loaders = { overview, devices: devicesView, users: usersView, keys: keysView, gateway: gatewayView, hosts: hostsView, policy: policyView, audit: auditView };
 
   function showDialog(title, subtitle = '', explicit = false) {
     if (dialog.open) closeDialog(true);
@@ -988,7 +1113,7 @@
     const { body, footer } = showDialog(title);
     body.append(el('p', '', description), el('span', 'review-target', target));
     const error = errorField(body);
-    const submit = button(action, () => modalMutation(null, error, submit, operation, () => { closeDialog(); notify(success); loadRoute(state.route); }), 'danger');
+    const submit = button(action, () => modalMutation(null, error, submit, operation, result => { closeDialog(); notify(typeof success === 'function' ? success(result) : success); loadRoute(state.route); }), 'danger');
     footer.append(button('Cancel', () => closeDialog(), 'quiet'), submit);
   }
 

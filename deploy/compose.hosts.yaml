@@ -15,7 +15,22 @@
 # records pointing each name at the hosts node. It copies the network's public
 # certificate to state/hosts-tls. Both are replaced by renaming files, so the
 # directories are mounted, never single files.
+#
+# The console's Hosts page reads hosts.json and domain.json. To change the hosts it writes
+# request.json to state/management/hosts, and the server's path unit runs
+# deploy.py apply-console-hosts, which answers in status.json there.
 services:
+  management:
+    environment:
+      COVEE_HOSTS_REQUEST_DIR: /data/hosts
+      COVEE_HOSTS_FILE: /etc/covee-hosts/hosts.json
+    volumes:
+      - type: bind
+        source: ${COVEE_DEPLOY_DIR:?}/state/hosts
+        target: /etc/covee-hosts
+        read_only: true
+        bind: {create_host_path: false}
+
   headscale:
     volumes:
       # The DNS records for the hosts, which the coordinator reloads when they change.

@@ -431,6 +431,128 @@ test('destinations through the gateway are listed, added and limited to people',
   assert.deepEqual(saved[0].entries[0], gateway.settings.entries[0], 'other entries are sent unchanged');
 });
 
+const hostsSession = canWrite => ({ body: { authenticated: true, csrfToken: 'csrf-fixture', permissions: { canRead: true, canWrite }, user: { name: 'Admin', role: canWrite ? 'Covee.Admin' : 'Covee.Reader' } } });
+const hostsFixture = () => ({ enabled: true, domain: 'mesh.test', revision: 'rev-1', problem: '', hostsDevice: { name: 'hosts', online: true },
+  devices: [{ name: 'mac-mini', online: true }, { name: 'pi', online: false }],
+  hosts: [
+    { name: 'grafana', device: 'mac-mini', port: 8080, path: '/a', scheme: 'http', verify: true, url: 'https://grafana.mesh.test', status: 'online' },
+    { name: 'nas', device: 'pi', port: 443, path: '', scheme: 'https', verify: false, url: 'https://nas.mesh.test', status: 'offline' },
+    { name: 'old', device: 'gone', port: 80, path: '', scheme: 'http', verify: true, url: 'https://old.mesh.test', status: 'missing' },
+  ] });
+const hostsHarness = (data, saved, reply, canWrite = true) => harness('hosts', async (path, options) => {
+  if (path === '/api/session') return hostsSession(canWrite);
+  if (path === '/api/hosts' && options.method === 'PUT') { saved.push(JSON.parse(options.body)); return reply ? reply() : { body: { ...data, warnings: [] } }; }
+  if (path === '/api/hosts') return { body: data };
+  throw new Error('Unexpected request ' + path);
+});
+const typeIn = (h, id, value) => { h.document.querySelector(id).value = value; };
+
+test('the hosts page explains how to add the first host', async () => {
+  const h = await hostsHarness({ enabled: false }, []);
+  assert.ok(h.document.root.textContent.includes('Add the first host with the covee command'));
+  assert.ok(h.document.root.textContent.includes('covee host add'));
+  assert.equal(h.findButton('Add host'), undefined);
+});
+
+test('hosts are listed with where they go and how their device is', async () => {
+  const h = await hostsHarness(hostsFixture(), []);
+  const text = h.document.root.textContent;
+  for (const part of ['grafana.mesh.test', 'mac-mini:8080/a', 'Device online', 'Device offline', 'Device removed', 'HTTPS, certificate not checked']) assert.ok(text.includes(part), part);
+});
+
+test('a reader sees the hosts but cannot change them', async () => {
+  const h = await hostsHarness(hostsFixture(), [], null, false);
+  assert.ok(h.document.root.textContent.includes('grafana.mesh.test'));
+  const add = h.findButton('Add host');
+  assert.ok(!add || add.disabled || add.hidden);
+});
+
+test('adding a host sends the whole list, tidied, with its revision', async () => {
+  const saved = [];
+  const h = await hostsHarness(hostsFixture(), saved);
+  await h.findButton('Add host').dispatch('click'); await h.flush();
+  typeIn(h, '#field-host-name', ' Jupyter ');
+  h.document.querySelector('#field-host-device').value = 'pi';
+  typeIn(h, '#field-host-port', '8888');
+  typeIn(h, '#field-host-path', 'lab/');
+  await h.document.querySelector('#host-form').dispatch('submit'); await h.flush();
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].revision, 'rev-1');
+  assert.equal(saved[0].hosts.length, 4);
+  assert.deepEqual({ ...saved[0].hosts[3] }, { name: 'jupyter', device: 'pi', port: 8888, path: '/lab/', scheme: 'http', verify: true });
+  assert.deepEqual({ ...saved[0].hosts[0] }, { name: 'grafana', device: 'mac-mini', port: 8080, path: '/a', scheme: 'http', verify: true }, 'other hosts are sent unchanged, without their page fields');
+});
+
+test('bad hosts are refused in the form, before the server', async () => {
+  const saved = [];
+  const h = await hostsHarness(hostsFixture(), saved);
+  await h.findButton('Add host').dispatch('click'); await h.flush();
+  const submit = async () => { await h.document.querySelector('#host-form').dispatch('submit'); await h.flush(); };
+  const error = () => h.document.querySelector('.form-error');
+  for (const [name, port, why] of [['a.b', '80', 'one word'], ['hosts', '80', 'network uses itself'], ['grafana', '80', 'already a host named'], ['ok', '0', '1 to 65535'], ['ok', '70000', '1 to 65535'], ['ok', '', '1 to 65535']]) {
+    typeIn(h, '#field-host-name', name); typeIn(h, '#field-host-port', port);
+    await submit();
+    assert.ok(error().textContent.includes(why), name + ' ' + port + ': ' + error().textContent);
+  }
+  assert.equal(saved.length, 0);
+});
+
+test('editing keeps the name and can turn on https without certificate checks', async () => {
+  const saved = [];
+  const h = await hostsHarness(hostsFixture(), saved);
+  await h.findButton('Edit').dispatch('click'); await h.flush();
+  assert.equal(h.document.querySelector('#field-host-name').disabled, true);
+  assert.equal(h.document.querySelector('#field-host-name').value, 'grafana');
+  typeIn(h, '#field-host-port', '3000');
+  h.document.querySelector('#field-host-path').value = '/';
+  h.document.querySelector('#field-host-https').checked = true;
+  h.document.querySelector('#field-host-skip').checked = true;
+  await h.document.querySelector('#host-form').dispatch('submit'); await h.flush();
+  assert.deepEqual({ ...saved[0].hosts[0] }, { name: 'grafana', device: 'mac-mini', port: 3000, path: '', scheme: 'https', verify: false });
+  assert.equal(saved[0].hosts.length, 3);
+});
+
+test('removing a host sends the list without it', async () => {
+  const saved = [];
+  const h = await hostsHarness(hostsFixture(), saved);
+  await h.findButton('Remove').dispatch('click'); await h.flush();
+  await h.findButton('Remove host').dispatch('click'); await h.flush();
+  assert.deepEqual([...saved[0].hosts].map(host => host.name), ['nas', 'old']);
+});
+
+test('the server’s refusal is shown in the form and the form stays open', async () => {
+  const h = await hostsHarness(hostsFixture(), [], () => ({ status: 400, body: { code: 'invalid_input', error: 'mac-mini is already the name of a device in this network; choose another name' } }));
+  await h.findButton('Add host').dispatch('click'); await h.flush();
+  typeIn(h, '#field-host-name', 'ok'); typeIn(h, '#field-host-port', '80');
+  await h.document.querySelector('#host-form').dispatch('submit'); await h.flush();
+  assert.ok(h.document.querySelector('.form-error').textContent.includes('already the name of a device'));
+  assert.ok(h.document.querySelector('#host-form'));
+});
+
+test('a host that left the list is never mistaken for another one', async () => {
+  const saved = [];
+  const data = hostsFixture();
+  const h = await hostsHarness(data, saved);
+  await h.findButton('Remove').dispatch('click'); await h.flush();
+  data.hosts.shift(); // grafana went while the dialog was open
+  await h.findButton('Remove host').dispatch('click'); await h.flush();
+  assert.equal(saved.length, 0);
+  assert.ok(h.document.root.textContent.includes('no longer in the list'));
+});
+
+test('warnings from a removal are shown', async () => {
+  const data = hostsFixture();
+  const h = await hostsHarness(data, [], () => ({ body: { warnings: ['Host old: No device named gone in this network'] } }));
+  await h.findButton('Remove').dispatch('click'); await h.flush();
+  await h.findButton('Remove host').dispatch('click'); await h.flush();
+  assert.ok(h.document.root.textContent.includes('Host old: No device named gone'));
+});
+
+test('an offline hosts device is shown as a problem', async () => {
+  const h = await hostsHarness({ ...hostsFixture(), hostsDevice: { name: 'hosts', online: false } }, []);
+  assert.ok(h.document.root.textContent.includes('The hosts device is offline'));
+});
+
 test('a stale gateway save says to refresh', async () => {
   const gateway = { enabled: true, revision: 'old', settings: { entries: [], dns: [] }, status: { device: null, routes: [], hosts: [], dns: { applied: true } } };
   const h = await harness('gateway', async (path, options) => {

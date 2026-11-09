@@ -104,6 +104,9 @@ func Status(ctx context.Context, env *Env, name string) error {
 		s.say("  Gateway: device %s; choose what goes through it on the console's Gateway page", srv.containerState(ctx, "gateway"))
 	}
 	if n.HostsEnabled {
+		// The console's Hosts page changes the list too. If the server can't say, show the last copy.
+		_ = s.useServerHosts(ctx, srv)
+		n = s.n
 		state := srv.containerState(ctx, "hosts-node")
 		if len(n.Hosts) == 0 {
 			s.say("  Hosts: none yet (hosts device %s); add one with `covee host add %s`", state, n.Name)

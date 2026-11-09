@@ -79,6 +79,11 @@ func (s *session) ensureMaintenance(ctx context.Context, srv *server) error {
 			return err
 		}
 	}
+	if s.n.HostsEnabled {
+		if err := s.installConsoleHosts(ctx, srv); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -55,6 +55,68 @@ func checkHostName(v string) error {
 	return nil
 }
 
+// The console's Hosts page asks for changes through a file; these units let the
+// server act on it, with deploy.py apply-console-hosts.
+const (
+	consoleHostsService = "covee-console-hosts.service"
+	consoleHostsPath    = "covee-console-hosts.path"
+)
+
+func consoleHostsUnits(runtime string) (service, path string) {
+	service = fmt.Sprintf(`# Installed by covee. Makes the changes asked for on the console's Hosts page (%[1]s).
+[Unit]
+Description=Apply the Covee console's changes to hosts
+After=docker.service
+ConditionPathExists=%[1]s/runtime.env
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=covee
+Group=covee
+WorkingDirectory=%[2]s
+ExecStart=/usr/bin/python3 %[2]s/scripts/deploy.py apply-console-hosts --directory %[1]s
+TimeoutStartSec=5min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+`, runtime, serverSource)
+	path = fmt.Sprintf(`# Installed by covee.
+[Unit]
+Description=Watch for changes from the Covee console's Hosts page
+
+[Path]
+PathChanged=%[1]s/state/management/hosts/request.json
+Unit=%[2]s
+
+[Install]
+WantedBy=paths.target
+`, runtime, consoleHostsService)
+	return service, path
+}
+
+func (s *session) installConsoleHosts(ctx context.Context, srv *server) error {
+	service, path := consoleHostsUnits(s.n.Runtime)
+	for name, body := range map[string]string{consoleHostsService: service, consoleHostsPath: path} {
+		if _, err := srv.covee.Output(ctx, "sudo -n tee "+remote.Quote("/etc/systemd/system/"+name)+" >/dev/null", []byte(body)); err != nil {
+			return fmt.Errorf("installing %s: %w", name, err)
+		}
+	}
+	if _, err := srv.covee.Output(ctx, "sudo -n systemctl daemon-reload && sudo -n systemctl enable --now "+consoleHostsPath, nil); err != nil {
+		return fmt.Errorf("enabling the watcher for the console's Hosts page: %w", err)
+	}
+	return nil
+}
+
+func (s *session) removeConsoleHosts(ctx context.Context, srv *server) error {
+	cmd := "sudo -n systemctl disable --now " + consoleHostsPath + "; sudo -n rm -f " +
+		remote.Quote("/etc/systemd/system/"+consoleHostsPath) + " " + remote.Quote("/etc/systemd/system/"+consoleHostsService) + " && sudo -n systemctl daemon-reload"
+	if _, err := srv.covee.Output(ctx, cmd, nil); err != nil {
+		return fmt.Errorf("removing the watcher for the console's Hosts page: %w", err)
+	}
+	return nil
+}
+
 // hostName turns what someone typed into a host's name: grafana, or the full
 // grafana.<mesh domain>, in any case.
 func hostName(v, meshDomain string) (string, error) {
@@ -183,11 +245,24 @@ func (s *session) hostsZoneOK() bool {
 	return z == "" || base == z || strings.HasSuffix(base, "."+z)
 }
 
-// HostList prints a network's hosts, as this computer knows them.
-func HostList(env *Env, name string) error {
+// HostList prints a network's hosts: the server's list, since the console's
+// Hosts page changes it too, or this computer's last copy if the server can't
+// be reached.
+func HostList(ctx context.Context, env *Env, name string) error {
 	n, err := env.Records.Load(name)
 	if err != nil {
 		return err
+	}
+	if n.HostsEnabled {
+		s, err := opened(ctx, env, name)
+		if err == nil {
+			err = s.useServerHosts(ctx, s.server(true))
+		}
+		if err == nil {
+			n = s.n
+		} else {
+			env.Ask.Say("The server could not be reached, so this is the list as this computer last saw it (%v).", err)
+		}
 	}
 	if len(n.Hosts) == 0 {
 		env.Ask.Say("Network %s has no hosts. Add one with `covee host add %s grafana --to mac-mini:8080`.", n.Name, n.Name)
@@ -254,6 +329,7 @@ func HostAdd(ctx context.Context, env *Env, name, host, to string, https, noVeri
 		}
 		hosts = append(hosts, target)
 	}
+	enabledBefore := s.n.HostsEnabled
 	if !s.n.HostsEnabled {
 		if err := s.enableHosts(ctx, srv, target, hosts); err != nil {
 			return err
@@ -271,6 +347,9 @@ func HostAdd(ctx context.Context, env *Env, name, host, to string, https, noVeri
 		s.say("Devices in network %s can now open %s → %s.", s.n.Name, hostURL(s.n, target), hostTarget(target))
 	}
 	s.say("%s needs to be on and connected to the network, with its service answering on port %d for other devices (not only for itself).", target.Device, target.Port)
+	if !enabledBefore {
+		s.say("From now on you can also add and change hosts on the console's Hosts page.")
+	}
 	return nil
 }
 
@@ -360,6 +439,9 @@ func HostsOff(ctx context.Context, env *Env, name string) error {
 	if err := s.syncConfig(ctx, srv); err != nil {
 		return err
 	}
+	if err := s.removeConsoleHosts(ctx, srv); err != nil {
+		return err
+	}
 	s.say("Hosts are off for %s, and its hosts device has left the network.", s.n.Name)
 	return nil
 }
@@ -440,6 +522,10 @@ func (s *session) enableHosts(ctx context.Context, srv *server, first record.Hos
 	}
 	if err := s.syncConfig(ctx, srv); err != nil {
 		return err
+	}
+	if err := s.installConsoleHosts(ctx, srv); err != nil {
+		// Hosts are on and the command still works; only the console's page waits.
+		s.say("  The console's Hosts page can't change hosts yet (%v). `covee update %s` tries again.", err, s.n.Name)
 	}
 	s.say("[3/3] Check the hosts device")
 	if state := srv.containerState(ctx, "hosts-node"); state != "healthy" {
@@ -603,7 +689,7 @@ func (s *session) useServerHosts(ctx context.Context, srv *server) error {
 		return nil
 	}
 	sort.Strings(differs)
-	s.say("This computer's list of hosts differs from the network's (%s); another computer may have changed it. Continuing from the network's list.", strings.Join(differs, ", "))
+	s.say("This computer's list of hosts differs from the network's (%s); the console or another computer may have changed it. Continuing from the network's list.", strings.Join(differs, ", "))
 	s.n.Hosts = held
 	if !s.n.HostsEnabled {
 		return nil

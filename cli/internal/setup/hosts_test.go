@@ -296,10 +296,10 @@ func TestHostsFlow(t *testing.T) {
 
 	// List and status show them.
 	h.out.Reset()
-	if err := HostList(h.env, "home"); err != nil {
+	if err := HostList(context.Background(), h.env, "home"); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.out.String(); got != "https://grafana.mesh.coveetest.io → mac-mini:3000\nhttps://nas.mesh.coveetest.io → nas:5001 (https, its certificate is not checked)\n" {
+	if got := h.out.String(); !strings.HasSuffix(got, "https://grafana.mesh.coveetest.io → mac-mini:3000\nhttps://nas.mesh.coveetest.io → nas:5001 (https, its certificate is not checked)\n") {
 		t.Fatalf("list:\n%s", got)
 	}
 	h.out.Reset()
@@ -347,7 +347,7 @@ func TestHostsFlow(t *testing.T) {
 		t.Fatalf("record: %v %+v", n.HostsEnabled, n.Hosts)
 	}
 	h.out.Reset()
-	if err := HostList(h.env, "home"); err != nil || !strings.Contains(h.out.String(), "has no hosts") {
+	if err := HostList(context.Background(), h.env, "home"); err != nil || !strings.Contains(h.out.String(), "has no hosts") {
 		t.Fatalf("empty list: %v\n%s", err, h.out)
 	}
 
@@ -369,6 +369,70 @@ func TestHostsFlow(t *testing.T) {
 	// The console in the network (on by default in setup) is named again.
 	if got := strings.Join(certNames(load()), ","); got != "control.coveetest.io,console.mesh.coveetest.io" {
 		t.Fatalf("the next certificate would name %s", got)
+	}
+}
+
+func TestTheConsolesHostsPageCanChangeTheListAfterTheFirstHost(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	setUpHome(t, h, nil)
+	h.env.Ask = h.answers(nil)
+	if err := HostAdd(ctx, h.env, "home", "grafana", "mac-mini:8080", false, false); err != nil {
+		t.Fatalf("first add: %v\n%s", err, h.out)
+	}
+	if !strings.Contains(h.out.String(), "console's Hosts page") {
+		t.Fatalf("the page was not mentioned:\n%s", h.out)
+	}
+	for _, unit := range []string{consoleHostsService, consoleHostsPath} {
+		if _, err := os.Stat(filepath.Join(h.state, "units", unit)); err != nil {
+			t.Fatalf("%s was not installed: %v", unit, err)
+		}
+	}
+	// The page adds a host: the command's list and status follow the server.
+	serverFile := filepath.Join(h.state, "server-hosts.json")
+	if err := os.WriteFile(serverFile, []byte(`{"hosts": [
+	  {"name": "grafana.mesh.coveetest.io", "device": "mac-mini", "port": 8080, "path": "", "scheme": "http", "verify": true},
+	  {"name": "wiki.mesh.coveetest.io", "device": "nas", "port": 3000, "path": "", "scheme": "http", "verify": true}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.out.Reset()
+	if err := HostList(ctx, h.env, "home"); err != nil || !strings.Contains(h.out.String(), "https://wiki.mesh.coveetest.io → nas:3000") {
+		t.Fatalf("list: %v\n%s", err, h.out)
+	}
+	// Turning hosts off removes the watcher.
+	h.env.Ask = h.answers(nil)
+	if err := HostsOff(ctx, h.env, "home"); err != nil {
+		t.Fatalf("off: %v\n%s", err, h.out)
+	}
+	if actions, _ := os.ReadFile(filepath.Join(h.state, "units", "actions")); !strings.Contains(string(actions), "console-hosts-removed") {
+		t.Fatalf("the watcher stayed: %s", actions)
+	}
+}
+
+func TestHostListFallsBackToThisComputersCopy(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	setUpHome(t, h, nil)
+	h.env.Ask = h.answers(nil)
+	if err := HostAdd(ctx, h.env, "home", "grafana", "mac-mini:8080", false, false); err != nil {
+		t.Fatalf("first add: %v\n%s", err, h.out)
+	}
+	if err := os.WriteFile(filepath.Join(h.state, "fail-read-hosts"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.out.Reset()
+	if err := HostList(ctx, h.env, "home"); err != nil || !strings.Contains(h.out.String(), "last saw it") || !strings.Contains(h.out.String(), "https://grafana.mesh.coveetest.io") {
+		t.Fatalf("list: %v\n%s", err, h.out)
+	}
+}
+
+func TestConsoleHostsUnitsActOnTheConsolesRequests(t *testing.T) {
+	service, path := consoleHostsUnits("/srv/covee/runtime-1")
+	if !strings.Contains(service, "deploy.py apply-console-hosts --directory /srv/covee/runtime-1") || !strings.Contains(service, "User=covee") {
+		t.Fatalf("service:\n%s", service)
+	}
+	if !strings.Contains(path, "PathChanged=/srv/covee/runtime-1/state/management/hosts/request.json") || !strings.Contains(path, "Unit="+consoleHostsService) {
+		t.Fatalf("path:\n%s", path)
 	}
 }
 

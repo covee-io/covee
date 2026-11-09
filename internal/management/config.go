@@ -45,6 +45,10 @@ type Config struct {
 	// keeps its settings and the files the device and the host read.
 	GatewayTag string
 	GatewayDir string
+	// HostsDir and HostsFile turn on the console's Hosts page: the directory
+	// for its requests to the server, and the list the hosts device serves.
+	HostsDir  string
+	HostsFile string
 }
 
 func ConfigFromEnv() (Config, error) {
@@ -74,6 +78,8 @@ func ConfigFromEnv() (Config, error) {
 	c.TLSKeyFile = os.Getenv("COVEE_TLS_KEY_FILE")
 	c.GatewayTag = os.Getenv("COVEE_GATEWAY_TAG")
 	c.GatewayDir = os.Getenv("COVEE_GATEWAY_DIR")
+	c.HostsDir = os.Getenv("COVEE_HOSTS_REQUEST_DIR")
+	c.HostsFile = os.Getenv("COVEE_HOSTS_FILE")
 	if c.mode() == "oidc" {
 		if _, set := os.LookupEnv("COVEE_ADMIN_TOKEN"); set {
 			return Config{}, errors.New("COVEE_ADMIN_TOKEN must be unset in OIDC mode")
@@ -145,6 +151,12 @@ func envDefault(key, fallback string) string {
 }
 
 func (c Config) validate() error {
+	if (c.HostsDir == "") != (c.HostsFile == "") {
+		return errors.New("COVEE_HOSTS_REQUEST_DIR and COVEE_HOSTS_FILE must be set together")
+	}
+	if c.HostsDir != "" && (!filepath.IsAbs(c.HostsDir) || !filepath.IsAbs(c.HostsFile)) {
+		return errors.New("COVEE_HOSTS_REQUEST_DIR and COVEE_HOSTS_FILE must be absolute paths")
+	}
 	if (c.GatewayTag == "") != (c.GatewayDir == "") {
 		return errors.New("COVEE_GATEWAY_TAG and COVEE_GATEWAY_DIR must be set together")
 	}
