@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Covee for Mac has **Check for Updates…**, in the Covee menu and the menu bar. It compares the app with the newest release on GitHub and offers its disk image and release notes.
+
 ## 0.1.2 (2026-11-09)
 
 - The console has a **Hosts** page. Once a network has its first host, admins can add, edit and remove hosts there, choosing the device from a list, and see whether each host's device is online. The first host still uses `covee host add`, which renews the certificate from the computer that manages the network. `covee update` adds the page to a network that already has hosts.

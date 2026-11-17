@@ -168,6 +168,7 @@ targets:
       - Tests
       - Shared/ClientConfiguration.swift
       - Shared/ProviderStatus.swift
+      - Shared/AppUpdate.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.covee.macos.tests
@@ -179,6 +180,7 @@ targets:
       - Tests
       - Shared/ClientConfiguration.swift
       - Shared/ProviderStatus.swift
+      - Shared/AppUpdate.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.covee.ios.tests

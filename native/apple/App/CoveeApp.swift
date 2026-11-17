@@ -21,6 +21,9 @@ struct CoveeApp: App {
         }
         .defaultSize(width: 900, height: 680)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { UpdateChecker.shared.check() }
+            }
             CommandGroup(replacing: .newItem) {}
             CommandGroup(replacing: .appSettings) { SettingsCommand(navigation: navigation) }
         }
@@ -50,6 +53,54 @@ struct CoveeApp: App {
 /// Covee keeps running in the menu bar after its window closes.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+}
+
+/// Check for Updates…: compares this app with the newest Covee release on GitHub and offers its disk image.
+@MainActor final class UpdateChecker {
+    static let shared = UpdateChecker()
+    private var checking = false
+
+    func check() {
+        guard !checking else { return }
+        checking = true
+        let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        Task {
+            defer { checking = false }
+            do {
+                show(try await AppUpdateResult.check(current: current))
+            } catch {
+                alert("Covee could not check for updates", error.localizedDescription, buttons: ["OK"])
+            }
+        }
+    }
+
+    private func show(_ result: AppUpdateResult) {
+        switch result {
+        case .upToDate(let current):
+            alert("Covee is up to date", "Version \(current) is the newest release.", buttons: ["OK"])
+        case .available(let release, let current):
+            let answer = alert("Covee \(release.version) is available",
+                               "You have version \(current). Download the new disk image, quit Covee and drag the new app into Applications."
+                                + " If you installed Covee with Homebrew, run brew upgrade --cask covee instead.",
+                               buttons: ["Download", "Release Notes", "Later"])
+            switch answer {
+            case .alertFirstButtonReturn: NSWorkspace.shared.open(release.downloadURL ?? release.pageURL)
+            case .alertSecondButtonReturn: NSWorkspace.shared.open(release.pageURL)
+            default: break
+            }
+        }
+    }
+
+    @discardableResult
+    private func alert(_ title: String, _ message: String, buttons: [String]) -> NSApplication.ModalResponse {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        buttons.forEach { alert.addButton(withTitle: $0) }
+        // From the menu bar Covee may have no window, so bring the alert to the front.
+        NSApp.activate()
+        return alert.runModal()
+    }
 }
 
 /// Settings… opens the Settings page of the one window.
@@ -166,6 +217,7 @@ private struct MenuStatusView: View {
         Divider()
         Toggle("Start at login", isOn: Binding(get: { startsAtLogin }, set: { setStartsAtLogin($0) }))
         Button("Open Covee") { show() }
+        Button("Check for Updates…") { UpdateChecker.shared.check() }
         Divider()
         Button("Quit Covee") { NSApplication.shared.terminate(nil) }
     }
