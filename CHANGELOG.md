@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Covee for Mac is a menu bar app. It's in the Dock and the app switcher only while one of its windows is open, and leaves them when you close the last one, staying connected in the menu bar.
+
 ## 0.1.2 (2026-11-09)
 
 - The console has a **Hosts** page. Once a network has its first host, admins can add, edit and remove hosts there, choosing the device from a list, and see whether each host's device is online. The first host still uses `covee host add`, which renews the certificate from the computer that manages the network. `covee update` adds the page to a network that already has hosts.

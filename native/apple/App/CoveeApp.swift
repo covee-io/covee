@@ -47,9 +47,40 @@ struct CoveeApp: App {
 }
 
 #if os(macOS)
-/// Covee keeps running in the menu bar after its window closes.
+/// Covee keeps running in the menu bar after its window closes. It starts as a menu bar app
+/// (`LSUIElement`), is in the Dock and the app switcher while one of its windows is open, and leaves
+/// them when the last one closes.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var observers: [NSObjectProtocol] = []
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let center = NotificationCenter.default
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didDeminiaturizeNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { AppDelegate.updateActivationPolicy(closing: nil) }
+            })
+        }
+        observers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            let closing = note.object as? NSWindow
+            MainActor.assumeIsolated { AppDelegate.updateActivationPolicy(closing: closing) }
+        })
+        Self.updateActivationPolicy(closing: nil)
+    }
+
+    /// Windows people open: titled ones, not the menu bar's or an alert's panel.
+    @MainActor private static func updateActivationPolicy(closing: NSWindow?) {
+        let open = NSApp.windows.contains { window in
+            window !== closing && !(window is NSPanel) && window.styleMask.contains(.titled)
+                && (window.isVisible || window.isMiniaturized)
+        }
+        let policy: NSApplication.ActivationPolicy = open ? .regular : .accessory
+        guard NSApp.activationPolicy() != policy else { return }
+        NSApp.setActivationPolicy(policy)
+        // Becoming a regular app does not bring up its menu bar until it is activated again.
+        if open { NSApp.activate() }
+    }
 }
 
 /// Settings… opens the Settings page of the one window.
