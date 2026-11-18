@@ -21,6 +21,9 @@ struct CoveeApp: App {
         }
         .defaultSize(width: 900, height: 680)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { UpdateChecker.shared.check() }
+            }
             CommandGroup(replacing: .newItem) {}
             CommandGroup(replacing: .appSettings) { SettingsCommand(navigation: navigation) }
         }
@@ -47,9 +50,88 @@ struct CoveeApp: App {
 }
 
 #if os(macOS)
-/// Covee keeps running in the menu bar after its window closes.
+/// Covee keeps running in the menu bar after its window closes. It starts as a menu bar app
+/// (`LSUIElement`), is in the Dock and the app switcher while one of its windows is open, and leaves
+/// them when the last one closes.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var observers: [NSObjectProtocol] = []
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let center = NotificationCenter.default
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didDeminiaturizeNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { AppDelegate.updateActivationPolicy(closing: nil) }
+            })
+        }
+        observers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            let closing = note.object as? NSWindow
+            MainActor.assumeIsolated { AppDelegate.updateActivationPolicy(closing: closing) }
+        })
+        Self.updateActivationPolicy(closing: nil)
+    }
+
+    /// Windows people open: titled ones, not the menu bar's or an alert's panel.
+    @MainActor private static func updateActivationPolicy(closing: NSWindow?) {
+        let open = NSApp.windows.contains { window in
+            window !== closing && !(window is NSPanel) && window.styleMask.contains(.titled)
+                && (window.isVisible || window.isMiniaturized)
+        }
+        let policy: NSApplication.ActivationPolicy = open ? .regular : .accessory
+        guard NSApp.activationPolicy() != policy else { return }
+        NSApp.setActivationPolicy(policy)
+        // Becoming a regular app does not bring up its menu bar until it is activated again.
+        if open { NSApp.activate() }
+    }
+}
+
+/// Check for Updates…: compares this app with the newest Covee release on GitHub and offers its disk image.
+@MainActor final class UpdateChecker {
+    static let shared = UpdateChecker()
+    private var checking = false
+
+    func check() {
+        guard !checking else { return }
+        checking = true
+        let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        Task {
+            defer { checking = false }
+            do {
+                show(try await AppUpdateResult.check(current: current))
+            } catch {
+                alert("Covee could not check for updates", error.localizedDescription, buttons: ["OK"])
+            }
+        }
+    }
+
+    private func show(_ result: AppUpdateResult) {
+        switch result {
+        case .upToDate(let current):
+            alert("Covee is up to date", "Version \(current) is the newest release.", buttons: ["OK"])
+        case .available(let release, let current):
+            let answer = alert("Covee \(release.version) is available",
+                               "You have version \(current). Download the new disk image, quit Covee and drag the new app into Applications."
+                                + " If you installed Covee with Homebrew, run brew upgrade --cask covee instead.",
+                               buttons: ["Download", "Release Notes", "Later"])
+            switch answer {
+            case .alertFirstButtonReturn: NSWorkspace.shared.open(release.downloadURL ?? release.pageURL)
+            case .alertSecondButtonReturn: NSWorkspace.shared.open(release.pageURL)
+            default: break
+            }
+        }
+    }
+
+    @discardableResult
+    private func alert(_ title: String, _ message: String, buttons: [String]) -> NSApplication.ModalResponse {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        buttons.forEach { alert.addButton(withTitle: $0) }
+        // From the menu bar Covee may have no window, so bring the alert to the front.
+        NSApp.activate()
+        return alert.runModal()
+    }
 }
 
 /// Settings… opens the Settings page of the one window.
@@ -166,6 +248,7 @@ private struct MenuStatusView: View {
         Divider()
         Toggle("Start at login", isOn: Binding(get: { startsAtLogin }, set: { setStartsAtLogin($0) }))
         Button("Open Covee") { show() }
+        Button("Check for Updates…") { UpdateChecker.shared.check() }
         Divider()
         Button("Quit Covee") { NSApplication.shared.terminate(nil) }
     }
