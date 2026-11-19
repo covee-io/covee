@@ -9,6 +9,7 @@ Covee collects nothing. The apps and the `covee` command send no analytics, cras
 ## The apps and the covee command
 
 - They connect only to the network server that you or your organization run, and to the services that network uses: your sign-in provider (Microsoft, Google or Apple) when you sign in, and, for the `covee` command, the DNS host, Let's Encrypt, the cloud accounts chosen during setup and checkip.amazonaws.com, to learn a network's public address.
+- Covee for Mac contacts GitHub only when you choose **Check for Updates…**, to read the version of the newest Covee release. GitHub receives your IP address and the app's version, as it does for a download.
 - Your network's server keeps what a network needs about you: your name and email address from your sign-in provider, your devices' names and addresses, and when they were last online. It stays on that server, under the control of whoever runs it; the Covee project never receives it. Ask your network's administrator what they keep and for how long.
 - On your device, the app keeps your network's address, its settings and the keys that identify the device, in the device's own storage and Keychain.
 - Traffic between devices is end-to-end encrypted with WireGuard. The network's server relays it when two devices cannot connect directly, but cannot read it.
@@ -29,4 +30,4 @@ Open an issue on [GitHub](https://github.com/covee-io/covee/issues). For a secur
 
 ## Changes
 
-If this policy changes, the new version is published here with its date. Last updated 19 October 2026.
+If this policy changes, the new version is published here with its date. Last updated 18 November 2026.

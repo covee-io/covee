@@ -11,7 +11,9 @@ Every device needs the network's address, such as `https://covee.example.com`, a
 
 Covee remembers each network it connects to, and connects to one at a time. To move to another, click it under **Your networks** on the Network page, or choose **Switch network** in the menu bar. To join a new one, click **Add network**, on the Network page or in the menu bar. A network you have used before needs no new sign-in. Control-click a network to change this device's name on it, or to forget it.
 
-Covee also lives in the menu bar. From there you can disconnect, see the other devices and copy their addresses, choose an exit node, and turn the network gateway's routes on or off (**Use the network's gateway**). Closing or quitting Covee leaves the Mac connected, and if the connection stops for any other reason, it starts again by itself; choose **Disconnect** to leave the network. Requires macOS 15 or later on Apple silicon.
+Covee also lives in the menu bar. From there you can disconnect, see the other devices and copy their addresses, choose an exit node, and turn the network gateway's routes on or off (**Use the network's gateway**). Covee is in the Dock only while one of its windows is open. Closing or quitting Covee leaves the Mac connected, and if the connection stops for any other reason, it starts again by itself; choose **Disconnect** to leave the network. Requires macOS 15 or later on Apple silicon.
+
+To see whether a newer Covee is out, choose **Check for Updates…** in the Covee menu or the menu bar. It offers the new disk image and its release notes; if you installed Covee with Homebrew, run `brew upgrade --cask covee` instead.
 
 ## iPhone
 
