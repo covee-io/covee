@@ -27,16 +27,19 @@ BUILD = ROOT / ".cache/covee/deploy/headscale-build"
 PREPARED_FOR = BUILD / "prepared-tree.sha256"
 IMAGE = "covee-headscale:hardened-local"
 SOURCE_COMMIT = "8106636c7f8d0cf8c9d4fb0beae94415069b768b"
-TEST_PACKAGES = ["./hscontrol", "./hscontrol/mapper", "./hscontrol/policy/...", "./hscontrol/servertest"]
+TEST_PACKAGES = ["./hscontrol", "./hscontrol/mapper", "./hscontrol/policy/...", "./hscontrol/servertest", "./hscontrol/state"]
 TEST_PATTERN = (
     "^(TestCoveeUnregisteredNoiseCannotReadMetrics|TestSSHAction.*|TestSSHPolicy.*|"
     "TestSSHCheck.*|TestCompileSSHPolicy.*|TestInitialMapCarriesDebugConfigOnEveryStream|"
     "TestMapResponseBuilder_WithDebugConfig|TestGenerateMapResponseDebugOnlyOnFullMaps|"
     "TestLogTailDisabledOnEveryStream|TestPolicyChanges|"
-    "TestPollNetMapHandler_DeletedNodeGetsExpiredSelf)$"
+    "TestPollNetMapHandler_DeletedNodeGetsExpiredSelf|"
+    "TestCoveeExpiredReloginClearsExpiredForPeers|TestReauthChange)$"
 )
 REQUIRED_TESTS = {
     "TestCoveeUnregisteredNoiseCannotReadMetrics",
+    "TestCoveeExpiredReloginClearsExpiredForPeers",
+    "TestReauthChange",
     "TestSSHActionHandler_RejectsWithoutCheck",
     "TestSSHActionFollowUp_RejectsVerdictAfterCheckRemoved",
     "TestSSHActionFollowUp_ConsumedVerdictNotReplayed",
@@ -134,8 +137,8 @@ def extract_source(archive: Path, destination: Path, commit: str) -> None:
                 raise BuildError(f"unsupported archive member: {member.name}")
 
 
-def capture(command: list[str], *, cwd: Path = ROOT) -> str:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+def capture(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True, env=env)
     if result.returncode:
         raise BuildError(f"command failed: {' '.join(command[:4])}\n{result.stderr[-4000:]}")
     return result.stdout.strip()
@@ -151,6 +154,21 @@ def made_for_lock(lock: dict) -> bool:
     if made_for is not None:
         return made_for == lock["patched_tree_sha256"]
     return tree_digest(SOURCE) == lock["patched_tree_sha256"]
+
+
+def apply_patches(staged: Path, lock: dict) -> None:
+    """Apply the locked patches to the extracted source in staged.
+
+    git apply run inside another repository's work tree (the build cache lives
+    in the checkout) reads patch paths from that repository's root and skips
+    every one outside the current directory, still exiting 0. Stopping the
+    repository search at staged makes it patch staged itself.
+    """
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(staged.resolve().parent)}
+    for patch in lock["patches"]:
+        patch_path = checked_relative(INPUTS, patch["path"])
+        capture(["git", "apply", "--check", str(patch_path)], cwd=staged, env=env)
+        capture(["git", "apply", str(patch_path)], cwd=staged, env=env)
 
 
 def prepare(lock: dict, reset_source: bool = False) -> None:
@@ -176,10 +194,7 @@ def prepare(lock: dict, reset_source: bool = False) -> None:
     with tempfile.TemporaryDirectory(prefix="headscale-prepare-", dir=BUILD) as temporary:
         staged = Path(temporary)
         extract_source(archive, staged, SOURCE_COMMIT)
-        for patch in lock["patches"]:
-            patch_path = checked_relative(INPUTS, patch["path"])
-            capture(["git", "apply", "--check", str(patch_path)], cwd=staged)
-            capture(["git", "apply", str(patch_path)], cwd=staged)
+        apply_patches(staged, lock)
         if tree_digest(staged) != lock["patched_tree_sha256"]:
             raise BuildError("deterministically patched tree does not match lock")
         if SOURCE.exists():

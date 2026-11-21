@@ -94,6 +94,16 @@ func Status(ctx context.Context, env *Env, name string) error {
 		return err
 	}
 	srv := s.server(true)
+	// Everything below asks the server. One that does not answer would make
+	// each check wait out its own SSH timeout and read as stopped services.
+	if _, err := srv.covee.Output(ctx, "true", nil); err != nil {
+		s.say("  Server: did not answer over SSH from this computer, so the state of its services is unknown")
+		s.say("    %v", err)
+		if n.Gateway {
+			s.say("    If this computer reaches %s through the network's gateway, check that the Covee app is connected to %s with \"Use the network's gateway\" on.", n.Server.Address, n.Name)
+		}
+		return nil
+	}
 	if n.DNS.Updater != nil {
 		s.say("  Address updater: %s", s.updaterStatus(ctx, srv))
 	}

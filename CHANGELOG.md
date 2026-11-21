@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 (2026-11-20)
+
+- A device whose key expired works again for everyone as soon as you sign it in again. Before, the other devices kept treating it as expired and dropped its traffic until they reconnected, so a gateway, an in-network console or a server could stay out of reach for days after a routine sign-in. `covee update` brings the fix to a network.
+- `covee status` says when it can't reach the server, instead of reporting the console, gateway and hosts devices as not running. A network with a gateway also gets a reminder to check the Covee app's "Use the network's gateway".
+
 ## 0.1.3 (2026-11-18)
 
 - Covee for Mac is a menu bar app. It's in the Dock and the app switcher only while one of its windows is open, and leaves them when you close the last one, staying connected in the menu bar.

@@ -111,14 +111,5 @@ func ConsoleInNetwork(ctx context.Context, env *Env, name string) error {
 // consoleNodeState is the console device container's health on the server.
 func (s *server) consoleNodeState(ctx context.Context) string {
 	out, err := s.covee.Output(ctx, "docker ps --filter name=console-node --format '{{.Status}}' | head -1", nil)
-	status := strings.TrimSpace(string(out))
-	switch {
-	case err != nil || status == "":
-		return "not running"
-	case strings.Contains(status, "(healthy)"):
-		return "healthy"
-	case strings.Contains(status, "starting"):
-		return "starting"
-	}
-	return "not connected"
+	return containerHealth(strings.TrimSpace(string(out)), err)
 }

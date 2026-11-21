@@ -3,6 +3,7 @@ package setup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,6 +65,27 @@ func TestGatewayTurnsOnAndOffForARunningNetwork(t *testing.T) {
 	if err := Status(ctx, h.env, "home"); err != nil || !strings.Contains(h.out.String(), "Gateway: device healthy") {
 		t.Fatalf("status: %v\n%s", err, h.out)
 	}
+
+	// A server that does not answer (here, the way it looks when the route to
+	// it through the gateway is down) is reported as such, not as stopped services.
+	reachable := h.env.SSH
+	h.env.SSH = filepath.Join(t.TempDir(), "ssh")
+	timeout := "#!/bin/sh\necho 'ssh: connect to host 192.168.50.20 port 22: Operation timed out' >&2\nexit 255\n"
+	if err := os.WriteFile(h.env.SSH, []byte(timeout), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h.out.Reset()
+	if err := Status(ctx, h.env, "home"); err != nil {
+		t.Fatalf("status with the server unreachable: %v\n%s", err, h.out)
+	}
+	if out := h.out.String(); !strings.Contains(out, "did not answer over SSH") || !strings.Contains(out, "Operation timed out") ||
+		!strings.Contains(out, `"Use the network's gateway"`) || strings.Contains(out, "not running") || strings.Contains(out, "Gateway: device") {
+		t.Fatalf("status with the server unreachable:\n%s", out)
+	}
+	if got := containerHealth("", errors.New("exit status 255")); got != unknownState {
+		t.Fatalf("an unanswered check reads %q", got)
+	}
+	h.env.SSH = reachable
 
 	// Off removes the device and the watcher; the record and config follow.
 	if err := Gateway(ctx, h.env, "home", true); err != nil {

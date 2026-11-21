@@ -201,9 +201,19 @@ func (s *session) setGateway(ctx context.Context, srv *server, on bool) error {
 // containerState is a service container's health on the server.
 func (s *server) containerState(ctx context.Context, service string) string {
 	out, err := s.covee.Output(ctx, "docker ps --filter "+remote.Quote("name=-"+service+"-")+" --format '{{.Status}}' | head -1", nil)
-	status := strings.TrimSpace(string(out))
+	return containerHealth(strings.TrimSpace(string(out)), err)
+}
+
+// unknownState is a service's state when the server did not answer.
+const unknownState = "unknown (the server did not answer)"
+
+// containerHealth reads a container's `docker ps` status. A server that did not
+// answer says nothing about the container, so it is not reported as stopped.
+func containerHealth(status string, err error) string {
 	switch {
-	case err != nil || status == "":
+	case err != nil:
+		return unknownState
+	case status == "":
 		return "not running"
 	case strings.Contains(status, "(healthy)"):
 		return "healthy"

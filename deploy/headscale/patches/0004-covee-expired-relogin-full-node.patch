@@ -1,0 +1,249 @@
+Covee: a device that signs in again after its key expired reaches its peers
+
+When a device's key expires, peers are sent the whole node with Expired set
+and MachineAuthorized cleared, and Tailscale clients keep both. A same-user
+relogin was then announced only as a key-rotation peer patch
+(change.NodeKeyRotated). tailcfg.PeerChange has no field for Expired or
+MachineAuthorized, so peers that stayed connected kept treating the device as
+expired: the route manager gives an expired peer no AllowedIPs, and its
+traffic was dropped both ways until each peer reconnected. A relogin of a
+node that had expired is now a whole-node add, as SetNodeExpiry already does
+when it un-expires a node. A relogin of a node that had not expired keeps the
+patch. Both sign-in paths (web/OIDC and pre-auth key) are covered.
+
+TestCoveeExpiredReloginClearsExpiredForPeers reproduces it with real control
+clients, for a key expired on the server and for logout then login; it fails
+without this change (the peer keeps Expired=true MachineAuthorized=false).
+
+diff --git a/hscontrol/servertest/covee_expired_relogin_test.go b/hscontrol/servertest/covee_expired_relogin_test.go
+new file mode 100644
+index 0000000..76b8158
+--- /dev/null
++++ b/hscontrol/servertest/covee_expired_relogin_test.go
+@@ -0,0 +1,120 @@
++package servertest_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/juanfont/headscale/hscontrol/servertest"
++	"github.com/juanfont/headscale/hscontrol/types"
++	"github.com/stretchr/testify/require"
++	"tailscale.com/tailcfg"
++)
++
++// TestCoveeExpiredReloginClearsExpiredForPeers reproduces a device whose key
++// expired signing in again while its peers stay connected. Expiry reaches the
++// peers as the whole node with Expired set, which the Tailscale client keeps;
++// a peer patch cannot clear Expired or MachineAuthorized, so after a
++// patch-only relogin the peers kept dropping the device's traffic until they
++// reconnected. The relogin must reach the peers as the whole node.
++func TestCoveeExpiredReloginClearsExpiredForPeers(t *testing.T) {
++	t.Parallel()
++
++	for _, tc := range []struct {
++		name string
++		// expire makes a's key expire while b stays connected, then signs a in again.
++		expire  func(t *testing.T, h *servertest.TestHarness, a *servertest.TestClient)
++		relogin func(t *testing.T, a *servertest.TestClient)
++	}{
++		{
++			name: "key_expired_on_server",
++			expire: func(t *testing.T, h *servertest.TestHarness, a *servertest.TestClient) {
++				t.Helper()
++
++				past := time.Now().Add(-time.Minute)
++				_, c, err := h.Server.State().SetNodeExpiry(nodeIDByName(t, h, a.Name), &past)
++				require.NoError(t, err)
++				h.Server.App.Change(c)
++			},
++			relogin: func(t *testing.T, a *servertest.TestClient) {
++				t.Helper()
++				a.Disconnect(t)
++				a.Reconnect(t)
++			},
++		},
++		{
++			name: "logout_then_login",
++			expire: func(t *testing.T, _ *servertest.TestHarness, a *servertest.TestClient) {
++				t.Helper()
++
++				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++				defer cancel()
++
++				require.NoError(t, a.LogoutAndDisconnect(ctx))
++			},
++			relogin: func(t *testing.T, a *servertest.TestClient) {
++				t.Helper()
++
++				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++				defer cancel()
++
++				require.NoError(t, a.ReloginAndPoll(ctx))
++			},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++
++			h := servertest.NewHarness(t, 2)
++			a, b := h.Client(0), h.Client(1)
++
++			tc.expire(t, h, a)
++			waitForPeer(t, b, a.Name, "marked expired", func(p tailcfg.NodeView) bool {
++				return p.Expired()
++			})
++
++			tc.relogin(t, a)
++			waitForPeer(t, b, a.Name, "usable again after signing in", func(p tailcfg.NodeView) bool {
++				return !p.Expired() && p.MachineAuthorized() &&
++					(p.KeyExpiry().IsZero() || p.KeyExpiry().After(time.Now()))
++			})
++		})
++	}
++}
++
++// waitForPeer waits until c sees the peer named name in the wanted state, and
++// otherwise fails with the state it last saw.
++func waitForPeer(t *testing.T, c *servertest.TestClient, name, want string, cond func(tailcfg.NodeView) bool) {
++	t.Helper()
++
++	deadline := time.Now().Add(15 * time.Second)
++	for time.Now().Before(deadline) {
++		if p, ok := c.PeerByName(name); ok && cond(p) {
++			return
++		}
++
++		time.Sleep(20 * time.Millisecond) //nolint:forbidigo // polling a client's netmap
++	}
++
++	p, ok := c.PeerByName(name)
++	if !ok {
++		t.Fatalf("%s never saw %s %s: the peer is missing", c.Name, name, want)
++	}
++
++	t.Fatalf("%s never saw %s %s: Expired=%v MachineAuthorized=%v KeyExpiry=%v Key=%v",
++		c.Name, name, want, p.Expired(), p.MachineAuthorized(), p.KeyExpiry(), p.Key().ShortString())
++}
++
++func nodeIDByName(t *testing.T, h *servertest.TestHarness, name string) types.NodeID {
++	t.Helper()
++
++	for _, n := range h.Server.State().ListNodes().All() {
++		if n.Hostname() == name {
++			return n.ID()
++		}
++	}
++
++	t.Fatalf("no node named %q", name)
++
++	return 0
++}
+diff --git a/hscontrol/state/persist_test.go b/hscontrol/state/persist_test.go
+index abad20c..91f193c 100644
+--- a/hscontrol/state/persist_test.go
++++ b/hscontrol/state/persist_test.go
+@@ -399,7 +399,9 @@ func TestReauthPreservesEndpointsWhenClientOmitsThem(t *testing.T) {
+ // relogin must be an incremental peer patch (so the tailscale client takes its
+ // fast patch path), never a whole-node add (which strands a re-keyed,
+ // momentarily-endpoint-less peer disco-deaf); a policy change forces a full
+-// recompute; a new node is a whole-node add.
++// recompute; a new node is a whole-node add. A relogin after expiry is a
++// whole-node add as well: peers hold the node as Expired, which a patch
++// cannot clear.
+ func TestReauthChange(t *testing.T) {
+ 	n := types.Node{
+ 		ID:       7,
+@@ -408,15 +410,20 @@ func TestReauthChange(t *testing.T) {
+ 	}
+ 	node := n.View()
+ 
+-	relogin := reauthChange(node, true, false)
++	relogin := reauthChange(node, true, false, false)
+ 	assert.Len(t, relogin.PeerPatches, 1, "relogin must be a peer patch")
+ 	assert.Empty(t, relogin.PeersChanged, "relogin must not be a whole-node add")
+ 
+-	added := reauthChange(node, false, false)
++	expired := reauthChange(node, true, true, false)
++	assert.Empty(t, expired.PeerPatches, "a relogin after expiry must not be a peer patch")
++	assert.Equal(t, []types.NodeID{node.ID()}, expired.PeersChanged,
++		"a relogin after expiry must re-advertise the whole node so peers clear Expired")
++
++	added := reauthChange(node, false, false, false)
+ 	assert.Empty(t, added.PeerPatches)
+ 	assert.Len(t, added.PeersChanged, 1, "a new node must be a whole-node add")
+ 
+-	pol := reauthChange(node, true, true)
++	pol := reauthChange(node, true, false, true)
+ 	assert.Empty(t, pol.PeerPatches, "a policy change must not be a peer patch")
+ 	assert.Empty(t, pol.PeersChanged)
+ 	assert.False(t, pol.IsEmpty(), "a policy change must be non-empty")
+diff --git a/hscontrol/state/state.go b/hscontrol/state/state.go
+index 3e4a7e7..0810870 100644
+--- a/hscontrol/state/state.go
++++ b/hscontrol/state/state.go
+@@ -2247,6 +2247,10 @@ func (s *State) HandleNodeFromAuthPath(
+ 	// Named conditions - describe WHAT we found, not HOW we check it.
+ 	existingNodeSameUser, nodeExistsForSameUser := all[types.UserID(user.ID)]
+ 
++	// Read before the update below renews the expiry: peers were sent this
++	// node as expired, which only a whole-node update clears (see reauthChange).
++	wasExpired := nodeExistsForSameUser && existingNodeSameUser.Valid() && existingNodeSameUser.IsExpired()
++
+ 	taggedNode, hasTagged := all[0]
+ 	existingNodeIsTagged := hasTagged && taggedNode.IsTagged()
+ 
+@@ -2357,7 +2361,7 @@ func (s *State) HandleNodeFromAuthPath(
+ 	// nodeExistsForSameUser is true only for a same-user relogin; a tag->user
+ 	// conversion is excluded, as it changes the peer's User — a structural
+ 	// change peers must see in full, not a key-rotation patch.
+-	return finalNode, reauthChange(finalNode, nodeExistsForSameUser, policyChanged), nil
++	return finalNode, reauthChange(finalNode, nodeExistsForSameUser, wasExpired, policyChanged), nil
+ }
+ 
+ // createNewNodeFromAuth creates a new node during auth callback.
+@@ -2483,6 +2487,12 @@ func (s *State) HandleNodeFromPreAuthKey(
+ 		return types.NodeView{}, change.Change{}, err
+ 	}
+ 
++	// Read before the update below renews the expiry: peers were sent this
++	// node as expired, which only a whole-node update clears (see reauthChange).
++	// Unlike isExpired below, tagged nodes count: a stale expiry stamp was
++	// advertised to peers all the same.
++	wasExpired := existsSameUser && existingNodeSameUser.Valid() && existingNodeSameUser.IsExpired()
++
+ 	// For existing nodes, skip validation if:
+ 	// 1. MachineKey matches (cryptographic proof of machine identity)
+ 	// 2. User/tag ownership matches (from the PAK being used)
+@@ -2833,7 +2843,7 @@ func (s *State) HandleNodeFromPreAuthKey(
+ 
+ 	policyChanged := !usersChange.IsEmpty() || !nodesChange.IsEmpty()
+ 
+-	return finalNode, reauthChange(finalNode, existsSameUser, policyChanged), nil
++	return finalNode, reauthChange(finalNode, existsSameUser, wasExpired, policyChanged), nil
+ }
+ 
+ // reauthChange returns the [change.Change] to broadcast after an authentication
+@@ -2843,11 +2853,18 @@ func (s *State) HandleNodeFromPreAuthKey(
+ // rotated) is sent as a minimal incremental peer patch via [change.NodeKeyRotated]
+ // rather than re-advertising the whole node. A policy change forces a full
+ // recompute; any other (new) node is a whole-node add.
+-func reauthChange(node types.NodeView, isRelogin, policyChanged bool) change.Change {
++//
++// A relogin of a node that had expired (wasExpired) is a whole-node add too.
++// Expiry reached the peers as the whole node with Expired set and
++// MachineAuthorized cleared, which Tailscale clients keep; a
++// [tailcfg.PeerChange] has no field for either, so after a patch the peers
++// would keep treating the node as expired and drop its traffic until they
++// reconnect. [State.SetNodeExpiry] un-expires a node the same way.
++func reauthChange(node types.NodeView, isRelogin, wasExpired, policyChanged bool) change.Change {
+ 	switch {
+ 	case policyChanged:
+ 		return change.PolicyChange()
+-	case isRelogin:
++	case isRelogin && !wasExpired:
+ 		return change.NodeKeyRotated(node)
+ 	default:
+ 		return change.NodeAdded(node.ID())

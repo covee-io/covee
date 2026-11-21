@@ -52,6 +52,7 @@ case "$last" in
   *'covee-payload-'*'mkdir'*) cat >/dev/null; echo /home/covee/covee-payload-0123456789ab ;;
   *"host_prepare.py' system"*) cat > "$STATE/system.json"; echo "Installing..."; echo '{"prepared":true,"changed":true}' ;;
   *'docker info'*) echo 28.5.0 ;;
+  true) ;;
   *'disable --now covee-dns.timer'*) printf '%s\n' "$last" >> "$STATE/dns-off" ;;
   *'disable --now covee-gateway-dns.path'*) mkdir -p "$STATE/units"; echo gateway-dns-removed >> "$STATE/units/actions" ;;
   *'disable --now covee-console-hosts.path'*) mkdir -p "$STATE/units"; echo console-hosts-removed >> "$STATE/units/actions" ;;

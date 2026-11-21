@@ -20,6 +20,23 @@ SPEC.loader.exec_module(builder)
 
 
 class HeadscaleIntegrityTests(unittest.TestCase):
+    def test_patches_apply_inside_another_repository(self):
+        # The build cache lives in the checkout; git apply there must still patch
+        # the staged tree instead of skipping every path and exiting 0.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            staged = root / "cache" / "staged"
+            (staged / "pkg").mkdir(parents=True)
+            (staged / "pkg" / "a.go").write_text("old\n")
+            inputs = root / "inputs"
+            (inputs / "patches").mkdir(parents=True)
+            (inputs / "patches" / "0001.patch").write_text(
+                "diff --git a/pkg/a.go b/pkg/a.go\n--- a/pkg/a.go\n+++ b/pkg/a.go\n@@ -1 +1 @@\n-old\n+new\n")
+            with patch.object(builder, "INPUTS", inputs):
+                builder.apply_patches(staged, {"patches": [{"path": "patches/0001.patch"}]})
+            self.assertEqual((staged / "pkg" / "a.go").read_text(), "new\n")
+
     def test_builder_refuses_root_and_preserves_operator_identity(self):
         lock = builder.read_lock()
         with patch.object(builder.os, "getuid", return_value=0):
